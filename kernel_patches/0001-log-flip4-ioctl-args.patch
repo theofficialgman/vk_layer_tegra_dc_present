@@ -1,0 +1,42 @@
+--- a/drivers/video/tegra/dc/ext/dev.c	2026-08-16 18:00:13.522477442 -0400
++++ b/drivers/video/tegra/dc/ext/dev.c	2026-08-16 18:00:46.524103308 -0400
+@@ -3025,6 +3025,39 @@
+ 			return -EFAULT;
+ 		}
+
++		/* Log every FLIP4 call with full per-window attributes, tagged
++		 * by caller, so a tear-free NVIDIA GLX present and our own
++		 * FLIP4-based test layer's calls can be compared side by side
++		 * on the exact ioctl args each one sends -- including fields
++		 * (win->flags, block_height_log2) that gate tiling/blend
++		 * modes and aren't otherwise visible from userspace. */
++		{
++			int _li;
++			dev_info(&_log_dc->ndev->dev,
++				"[tegra-dc-ext] FLIP4 from '%s' (pid %d) on DC%d win_num=%d flags=0x%x\n",
++				current->comm, current->pid, _log_dc->ctrl_num,
++				win_num, args.flags);
++			for (_li = 0; _li < win_num; _li++) {
++				struct tegra_dc_ext_flip_windowattr *w = &win[_li];
++				dev_info(&_log_dc->ndev->dev,
++					"[tegra-dc-ext]   win[%d] idx=%d buff_id=%u blend=%u"
++					" fmt=%u off=%u stride=%u w=%u h=%u x=%u y=%u"
++					" out=(%u,%u %ux%u) z=%u alpha=%u wflags=0x%x"
++					" blockh_log2=%u swap_interval=%u"
++					" buff_id_u=%u buff_id_v=%u off_u=%u off_v=%u stride_uv=%u"
++					" pre_syncpt_id=%d pre_syncpt_val=%u\n",
++					_li, w->index, w->buff_id, w->blend,
++					w->pixformat, w->offset, w->stride,
++					w->w, w->h, w->x, w->y,
++					w->out_x, w->out_y, w->out_w, w->out_h,
++					w->z, (unsigned int)w->global_alpha, w->flags,
++					(unsigned int)w->block_height_log2, w->swap_interval,
++					w->buff_id_u, w->buff_id_v, w->offset_u, w->offset_v,
++					w->stride_uv,
++					(s32)w->pre_syncpt_id, w->pre_syncpt_val);
++			}
++		}
++
+ 		nr_user_data = args.nr_elements;
+ 		flip_user_data = kzalloc(sizeof(*flip_user_data)
+ 					* nr_user_data, GFP_KERNEL);

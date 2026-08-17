@@ -1,0 +1,32 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later
+ *
+ * Copyright (C) 2026 gavin_darkglider
+ * Copyright (C) 2026 theofficialgman
+ * Copyright (C) 2026 Anthropic (Claude AI assistant contributions)
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ */
+
+/* Vulkan layer interface v2 only needs vkNegotiateLoaderLayerInterfaceVersion
+   exported by symbol name; the loader gets pointers to the GIPA and GDPA via
+   the VkNegotiateLayerInterface struct filled in by that function.
+
+   Exporting vkGetInstanceProcAddr or vkGetDeviceProcAddr from a layer .so
+   can interfere with the loader's terminator/ICD path when it does
+   dlsym(RTLD_DEFAULT, "vkGetInstanceProcAddr") and accidentally resolves
+   to OUR symbol instead of the loader's, leading to recursive re-entry
+   into vkCreateInstance while the loader-side mutex is held — classic
+   deadlock observed on systems with multiple ICDs registered.
+
+   Hide GIPA/GDPA. The loader will route through our negotiate-supplied
+   function pointers instead.
+*/
+{
+    global:
+        vkNegotiateLoaderLayerInterfaceVersion;
+    local:
+        *;
+};

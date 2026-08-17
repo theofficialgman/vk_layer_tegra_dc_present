@@ -1,0 +1,69 @@
+#version 450
+/* Applies the empirically-derived Tegra X1 block-linear GOB swizzle
+ * (see the "GOB block-linear formula" section of README.md, verified
+ * 2026-08-16) to convert the app's rendered OPTIMAL-tiled image into a
+ * raw byte buffer laid out the way TEGRA_DC_EXT_FLIP_FLAG_BLOCKLINEAR
+ * expects, so FLIP4 can present it directly -- combining the causally-
+ * verified tear-free BLOCKLINEAR path with actually-correct content,
+ * instead of the uniform-fill proxy used to verify tearing alone. */
+
+layout(local_size_x = 16, local_size_y = 8) in;
+
+layout(binding = 0, rgba8) uniform readonly image2D srcImage;
+layout(binding = 1, std430) buffer DstBuffer {
+    uint data[];
+} dst;
+
+layout(push_constant) uniform PC {
+    uint width;
+    uint height;
+    uint blockHeightLog2;
+    uint gobsWide;
+} pc;
+
+/* x: byte offset within one GOB row (0-63), y: row within the GOB (0-7).
+ * Returns the swizzled byte offset within the 512-byte GOB (0-511). */
+uint gobSwizzle(uint x, uint y) {
+    uint x0 = x & 1u, x1 = (x >> 1) & 1u, x2 = (x >> 2) & 1u;
+    uint x3 = (x >> 3) & 1u, x4 = (x >> 4) & 1u, x5 = (x >> 5) & 1u;
+    uint y0 = y & 1u, y1 = (y >> 1) & 1u, y2 = (y >> 2) & 1u;
+    return (x5 << 8) | (y2 << 7) | (y1 << 6) | (x4 << 5) | (y0 << 4) | (x3 << 3) | (x2 << 2) | (x1 << 1) | x0;
+}
+
+void main() {
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    if (x >= pc.width || y >= pc.height) return;
+
+    vec4 color = imageLoad(srcImage, ivec2(x, y));
+    /* Target format is B8G8R8A8_UNORM (byte order B,G,R,A in memory) --
+     * packUnorm4x8 packs its argument's components in order as bytes 0..3,
+     * so feed it (B,G,R,A) to get the right byte order directly. */
+    uint packed = packUnorm4x8(vec4(color.b, color.g, color.r, color.a));
+
+    uint gobCol = x / 16u;
+    uint gobsPerBlock = 1u << pc.blockHeightLog2;
+    uint rowsPerBlock = 8u << pc.blockHeightLog2;
+    uint blockIdx = y / rowsPerBlock;
+    uint rowInBlock = y % rowsPerBlock;
+    uint gobRowInBlock = rowInBlock / 8u;
+    uint rowInGob = rowInBlock % 8u;
+
+    /* GOBs within a block are laid out COLUMN-major (verified 2026-08-16:
+     * row-major produced a repeating X-axis artifact; column-major gave a
+     * perfectly clean result on both axes). */
+    uint gobIndexInBlock = gobCol * gobsPerBlock + gobRowInBlock;
+    uint bytesPerBlock = pc.gobsWide * gobsPerBlock * 512u;
+    uint gobBase = blockIdx * bytesPerBlock + gobIndexInBlock * 512u;
+
+    /* The 4 bytes of one pixel stay contiguous under this swizzle: byteX's
+     * low 2 bits map directly (unshuffled) to the output's low 2 bits, and
+     * (x%16)*4 is always a multiple of 4, so bytes 0..3 of one pixel only
+     * vary those low 2 bits -- confirmed empirically by the clean
+     * FLIP_TEST_GOB_PROBE=2 result, which wrote the same way byte-by-byte
+     * on the CPU. One packed 32-bit store here instead of 4 separate byte
+     * stores. */
+    uint byteXBase = (x % 16u) * 4u;
+    uint finalOffset = gobBase + gobSwizzle(byteXBase, rowInGob);
+    dst.data[finalOffset / 4u] = packed;
+}
