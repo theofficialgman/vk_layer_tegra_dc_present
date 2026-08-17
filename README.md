@@ -803,3 +803,63 @@ Not yet root-caused at the kernel-timing level *why* ~33ms specifically
 isn't enough (vs. some other deferred-kthread latency bound that could be
 fixed at the source instead of worked around with more buffering) -- the
 3-image floor is a confirmed, shipped fix, not a full explanation.
+
+## Update 2026-08-17 part 2: dolphin-emu windowed→fullscreen transition, fixed
+
+`dolphin-emu` reliably crashed (SIGSEGV) when transitioning from its
+windowed startup UI to fullscreen (what it does on starting a game). It
+was first reproduced under `gdb`, with an identical, unsymbolized crash
+(inside dolphin's JIT-generated GameCube CPU recompiler code, "CPU
+thread") occurring both with and without this layer loaded -- pointing at
+a gdb/JIT interaction artifact, not a layer bug, and dolphin does run fine
+outside gdb without the layer. That left one untested combination: no
+gdb, **with** the layer.
+
+Running that combination reproduced a real, deterministic failure --
+no gdb involved, no segfault either, just a clean process exit right
+after:
+
+```
+[...] DestroySwapchainKHR: swapchain=0x...        <- old 640x480 windowed swapchain torn down
+[...] FLIP_TEST: targeting /dev/tegra_dc_1 window 1 <- new fullscreen swapchain starting
+[VK_LAYER_FLIP_test ERR] FLIP_TEST: GET_WINDOW 1 on /dev/tegra_dc_1 failed: Device or resource busy
+```
+
+`worker_shutdown()` (called from `layer_DestroySwapchainKHR`) is fully
+synchronous -- it sets a quit flag and `pthread_join()`s the worker
+thread, which itself `close()`s `sc->flip_dc_fd` as the last thing it does
+before returning. So by the time the old swapchain's `DestroySwapchainKHR`
+returns, our own process should have zero references to that fd left.
+Yet the very next `GET_WINDOW` (a different fd, freshly opened for the
+new fullscreen swapchain) found the window still marked busy by the
+kernel driver.
+
+Root cause, found by polling `lsof /dev/tegra_dc_1` once per 100ms across
+the transition: for a couple of polls right after our own close, the fd
+was held open not by dolphin-emu, but by **`xdg-screensaver` and
+`xprop`** -- unrelated helper processes that Qt/KDE apps commonly spawn to
+inhibit the screensaver when entering fullscreen -- both holding the exact
+same inode (confirmed via matching device/inode numbers in the `lsof`
+output) that we had just closed our own copy of. `open(flip_dc_path,
+O_RDWR)` (and the sibling `open("/dev/nvhost-ctrl", O_RDWR)`) were both
+missing `O_CLOEXEC`, so when dolphin forked+exec'd that screensaver-inhibit
+helper, the child inherited our raw fd across the `exec()`. The kernel
+driver's window-release logic (tied to the file's last close, i.e. the
+last reference across *all* processes, not just ours) kept the window
+marked busy for as long as that unrelated, short-lived child process still
+held its inherited copy open -- racing the immediately-following new
+swapchain's `GET_WINDOW` and losing.
+
+Fix: add `O_CLOEXEC` to both `open()` calls in `layer_CreateSwapchainKHR`
+(`flip_dc_fd` and `flip_nvhost_ctrl_fd`) so fork+exec'd helper processes
+never inherit them in the first place. Confirmed fixed: rebuilt, ran
+dolphin-emu with the layer (no gdb) through the windowed→fullscreen
+transition into actual gameplay multiple times with no `GET_WINDOW`
+failures and no crash -- user-confirmed working, including closing the
+app cleanly afterward.
+
+This also means the original gdb-crash theory, while plausibly still real
+for whatever dolphin+gdb-specific issue it was, was never actually tested
+against the right combination -- the crash the user originally hit when
+starting a game normally (no gdb, layer loaded) was this fd-inheritance
+race the whole time, not the gdb/JIT artifact.

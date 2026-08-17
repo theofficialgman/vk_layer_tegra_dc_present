@@ -3254,7 +3254,17 @@ layer_CreateSwapchainKHR(VkDevice device,
     LOG_INFO("FLIP_TEST: targeting %s window %d", flip_dc_path, flip_win_index);
     sc->flip_win_index = flip_win_index;
 
-    sc->flip_dc_fd = open(flip_dc_path, O_RDWR);
+    /* O_CLOEXEC matters here: without it, a helper process the app forks
+     * (e.g. a screensaver-inhibit script Qt/KDE apps launch on entering
+     * fullscreen) inherits this fd across exec(), and the kernel driver
+     * won't release the window claim -- via TEGRA_DC_EXT_GET_WINDOW's
+     * matching release logic -- while that unrelated child still holds a
+     * duplicate reference, even after we close our own copy. Confirmed via
+     * lsof 2026-08-17: dolphin-emu's windowed->fullscreen transition spawns
+     * xdg-screensaver/xprop, which briefly held our just-closed DC fd open,
+     * causing the immediately-following new swapchain's GET_WINDOW to fail
+     * EBUSY. */
+    sc->flip_dc_fd = open(flip_dc_path, O_RDWR | O_CLOEXEC);
     if (sc->flip_dc_fd < 0) {
         LOG_ERR("FLIP_TEST: open %s failed: %m", flip_dc_path);
         goto fail_perimg;
@@ -3303,7 +3313,7 @@ layer_CreateSwapchainKHR(VkDevice device,
             LOG_ERR("FLIP_TEST: GET_VBLANK_SYNCPT failed: %m");
             goto fail_perimg;
         }
-        sc->flip_nvhost_ctrl_fd = open("/dev/nvhost-ctrl", O_RDWR);
+        sc->flip_nvhost_ctrl_fd = open("/dev/nvhost-ctrl", O_RDWR | O_CLOEXEC);
         if (sc->flip_nvhost_ctrl_fd < 0) {
             LOG_ERR("FLIP_TEST: open /dev/nvhost-ctrl failed: %m");
             goto fail_perimg;
