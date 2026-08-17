@@ -524,10 +524,38 @@ for free on this driver, so you have to build one yourself.
    `SHADER_READ_ONLY_OPTIMAL`) brackets the dispatch so the app's next
    render pass sees the layout it expects.
 
+## Update 2026-08-16 part 4: fd leak found during extended runs, fixed
+
+Confirmed the "only observed for a short live run" gap below was hiding a
+real bug: after running for a while (variable delay, since it depends on how
+many fds happen to already be open), `dmesg` showed repeated `tegradc
+tegradc.1: Failed creating fence err:-24` (`-24` = `-EMFILE`, "too many open
+files"), followed by tearing returning persistently.
+
+**Root cause:** `tegra_dc_ioctl()` (dev.c) treats `struct
+tegra_dc_ext_flip_4.post_syncpt_fd` as an *output* parameter, not just
+input, whenever no explicit sync-fence is requested via flip user-data
+(`syncpt_idx == -1`, our case, since we never set any) -- it creates a
+**brand-new post-flip sync fence fd on every single `FLIP4` call** and
+writes it back into that field, regardless of what was passed in (we always
+sent `-1`). Every call site in this file set `post_syncpt_fd = -1` before
+the ioctl and never looked at it afterward -- one leaked fd per flip call,
+confirmed empirically (`ls /proc/<pid>/fd | wc -l` climbing ~60/s, matching
+the flip rate exactly). Once the process hit `RLIMIT_NOFILE`, the kernel's
+*own* internal fence creation for that same flip started failing, and
+whatever ordering guarantee that fence was providing went with it --
+explaining why tearing came back once the errors started.
+
+**Fix:** close `flip.post_syncpt_fd` immediately after every
+`ioctl(..., TEGRA_DC_EXT_FLIP4, ...)` call, in both the per-frame worker
+loop and the shutdown/disable-window call. Verified: fd count is now flat
+(~124-126, no growth) over 45+ seconds of continuous fullscreen rendering,
+vs. the ~2700 fds that would have leaked in that time before the fix.
+
 **Not yet validated / worth doing before treating this as production-ready:**
-- Only observed for a short live run -- no extended-duration soak test,
-  no stress test of the backpressure/reuse timing under this new (heavier
-  per-frame GPU cost) path.
+- Confirmed stable over ~45s continuous runs post-fix; still no long
+  (multi-minute/hour) soak test, no stress test of the backpressure/reuse
+  timing under this path's heavier per-frame GPU cost.
 - Performance overhead of the compute dispatch itself hasn't been measured
   (adds real GPU work every frame beyond what the LINEAR copy needed;
   probably still cheap relative to a frame budget, but unmeasured).

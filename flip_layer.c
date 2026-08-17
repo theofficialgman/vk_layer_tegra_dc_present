@@ -1719,6 +1719,21 @@ static void *worker_thread_main(void *arg) {
             }
             if (_f4_ret < 0)
                 LOG_WARN("FLIP_TEST: FLIP4 failed: %m");
+            /* tegra_dc_ioctl() (dev.c) uses post_syncpt_fd as an OUTPUT
+             * slot, not just input: with no explicit user_data syncpt
+             * request (we send none), it creates a brand new post-flip
+             * sync fence fd EVERY call and writes it back here, regardless
+             * of what we passed in. We don't consume post-flip fences (our
+             * own Vulkan-side fencing already gates reuse), so leaving
+             * this unread leaks one fd per flip -- confirmed empirically
+             * 2026-08-16 (open fd count climbing ~60/s, matching the flip
+             * rate exactly) and matches the reported symptom: once the
+             * process hits RLIMIT_NOFILE, the kernel's own internal fence
+             * creation starts failing ("Failed creating fence err:-24" ==
+             * -EMFILE), and tearing follows -- losing whatever ordering
+             * that fence was providing. Must close it every call. */
+            if (flip.post_syncpt_fd >= 0)
+                close(flip.post_syncpt_fd);
         }
 
         /* Capture the vblank timestamp: right after the SGI wait above,
@@ -1796,6 +1811,7 @@ static void *worker_thread_main(void *arg) {
         flip.win_num = 1;
         flip.post_syncpt_fd = -1;
         ioctl(sc->flip_dc_fd, TEGRA_DC_EXT_FLIP4, &flip);
+        if (flip.post_syncpt_fd >= 0) close(flip.post_syncpt_fd); /* see the per-frame call's comment */
     }
     if (sc->flip_nvhost_ctrl_fd >= 0) close(sc->flip_nvhost_ctrl_fd);
     if (sc->flip_dc_fd >= 0) close(sc->flip_dc_fd);
