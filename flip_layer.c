@@ -1381,7 +1381,8 @@ static void *worker_thread_main(void *arg) {
                 uint32_t pc[4] = {
                     sc->extent.width, sc->extent.height,
                     (uint32_t)sc->gob_block_height_log2,
-                    (sc->extent.width * 4) / 64,
+                    (sc->extent.width * 4 + 63) / 64, /* round up -- must match
+                        create_gob_dest's gobs_wide and pi->flip_row_pitch */
                 };
                 d->CmdPushConstants(pi->flip_cmdbuf, sc->gob_pipeline_layout,
                                     VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
@@ -2257,7 +2258,12 @@ static bool create_flip_export_image(DevNode *dev, Swapchain *sc, PerImage *pi) 
         VkDeviceSize rows_per_block = (VkDeviceSize)8 << bhl2_for_pattern;
         VkDeviceSize gobs_per_block = rows_per_block / 8;
         uint32_t width = sc->extent.width, height = sc->extent.height;
-        uint32_t gobs_wide = (width * 4) / 64; /* 160 for 2560px @ 4bpp */
+        /* Round up -- see the matching comment in create_gob_dest. Also
+           overrides pi->flip_row_pitch (win.stride) below to match, for
+           the same reason: the DC must derive the same gobs_wide we used
+           to place our writes, or the two sides disagree about where each
+           block starts. */
+        uint32_t gobs_wide = (width * 4 + 63) / 64;
         VkDeviceSize bytes_per_gob_row = (VkDeviceSize)gobs_wide * 512;
         VkDeviceSize bytes_per_block = bytes_per_gob_row * gobs_per_block;
         /* FLIP_TEST_GOB_ORDER: how GOBs are laid out within one block, still
@@ -2324,6 +2330,11 @@ static bool create_flip_export_image(DevNode *dev, Swapchain *sc, PerImage *pi) 
                 }
             }
             d->UnmapMemory(dev->device, pi->flip_memory);
+            /* win.stride (set from this) must match the rounded-up
+               gobs_wide used for our own block-stride addressing above,
+               not the natural LINEAR-image row pitch queried earlier --
+               see the gobs_wide comment above. */
+            pi->flip_row_pitch = (VkDeviceSize)gobs_wide * 64;
             LOG_INFO("FLIP_TEST: GOB swizzle verification pattern written (%ux%u, gobs_wide=%u, gobs_per_block=%llu)",
                      width, height, gobs_wide, (unsigned long long)gobs_per_block);
         } else {
@@ -2525,7 +2536,21 @@ static bool create_gob_dest(DevNode *dev, Swapchain *sc, PerImage *pi) {
         return false;
 
     uint32_t width = sc->extent.width, height = sc->extent.height;
-    uint32_t gobs_wide = (width * 4) / 64;
+    /* Round UP to a whole GOB-column (16px @ 4bpp), not down: a width not
+       evenly divisible by 16 (e.g. vkcube's default 500, vs. gears'
+       fullscreen 2560 which happens to be exactly 160 GOBs -- never
+       exposed this before) otherwise leaves the last, partial GOB-column
+       (here, 4 real pixels out of 16) writing past bytes_per_block's
+       boundary into the *next* block's territory, corrupting it (found
+       via vkcube + FLIP_TEST_GOB_PROBE=2 2026-08-16 -- visible as
+       combing at the right edge plus a repeating sawtooth artifact at
+       every block boundary). Rounding only OUR OWN gobs_wide up isn't
+       enough by itself (tried 2026-08-16, made it worse) -- the DC derives
+       its own internal gobs_wide from win.stride, so that must be told
+       the same rounded-up value too, not the raw width*4 (see
+       pi->flip_row_pitch below), or the two sides disagree about where
+       each block starts. */
+    uint32_t gobs_wide = (width * 4 + 63) / 64;
     long bhl2 = sc->gob_block_height_log2;
     VkDeviceSize gobs_per_block = (VkDeviceSize)1 << bhl2;
     VkDeviceSize rows_per_block = gobs_per_block * 8;
@@ -2605,7 +2630,10 @@ static bool create_gob_dest(DevNode *dev, Swapchain *sc, PerImage *pi) {
 
     pi->flip_fd = -1; /* not used in this mode; buff_id comes from gob_dst_fd */
     pi->flip_offset = 0;
-    pi->flip_row_pitch = (VkDeviceSize)width * 4;
+    /* win.stride (set from this) must match the rounded-up gobs_wide used
+       for our own block-stride addressing above, not the raw width*4 --
+       see the gobs_wide comment. */
+    pi->flip_row_pitch = (VkDeviceSize)gobs_wide * 64;
     return true;
 
 fail_view:

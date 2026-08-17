@@ -644,6 +644,46 @@ logs `window is on output 'DP-0' -> recognized` and targets
 live end-to-end behavior (real content, tear-free) is unaffected by this
 change.
 
+## Update 2026-08-16 part 7: non-16-pixel-aligned widths (vkcube)
+
+`vkcube` (default 500x500, unlike gears' fullscreen 2560x1600) rendered
+visibly wrong under `FLIP_TEST_GOB_REAL` -- fine combing/interlacing across
+the whole image. Confirmed via user testing: **width not evenly divisible
+by 16px (one GOB, 64 bytes @ 4bpp) is the trigger; height doesn't matter**
+(2560 is exactly 160 GOBs wide; 500 is 31.25).
+
+Root cause, found via `FLIP_TEST_GOB_PROBE=2` at `--width 500`: `gobs_wide`
+(`width*4/64`, used for `bytes_per_block = gobs_wide * gobs_per_block *
+512`, i.e. where each vertical block starts) was computed with truncating
+division. For width=500, `floor(2000/64)=31`, but the real last GOB-column
+is index 31 (`gob_col = x/16` reaches 31 for x=496..499) -- so writes for
+that last, partial column (`gob_index_in_block = gob_col * gobs_per_block +
+gob_row_in_block`, up to `31*16+15=511`) land *past* `bytes_per_block`
+(`31*16*512`), spilling into the next block's territory and corrupting its
+first column.
+
+First attempt (just rounding `gobs_wide` up to 32) made it *worse* --
+because only our own write-side addressing changed; `win.stride` (what
+tells the DC where it thinks each block starts) was left at the
+unrounded `width*4`, so our writes and the DC's reads now disagreed about
+block boundaries for *every* block, not just the last column. The correct
+fix needs both sides consistent: round `gobs_wide` up **and** set
+`win.stride` (via `pi->flip_row_pitch`) to `gobs_wide * 64` (the padded
+value, 2048 for width=500) instead of the raw `width*4` (2000) -- applied
+in both `create_gob_dest` (the real content path) and the
+`FLIP_TEST_GOB_PROBE=2` verification path, which must stay consistent with
+each other by construction.
+
+This fixed the block-to-block misalignment (confirmed via probe: the
+sawtooth pattern repeating across the whole image is gone). A smaller,
+localized artifact at the last partial column specifically was still
+visible in the synthetic gradient probe pattern -- but **confirmed fixed
+for real rendered content** (`vkcube` at various widths, `FLIP_TEST_GOB_REAL=1`)
+by direct visual check, which is what matters in practice. Not fully root-
+caused at the byte level, but shipped since it resolves the actual
+problem; worth revisiting with the probe technique if it resurfaces on
+real content at some other non-aligned width.
+
 Since that closed blob still has to talk to the *open* kernel driver to get
 pixels on screen, its ioctl traffic is the one part of it that's still
 observable: `kernel_patches/0001-log-flip4-ioctl-args.patch` (against
