@@ -740,3 +740,66 @@ something new needed instrumenting. With them on, a `kprobe_events` in
 `/sys/kernel/debug/tracing` could hook things like `tegra_dc_ext_flip()` or
 `tegra_dc_ext_flip_worker()` on demand, no rebuild required -- useful well
 beyond this specific investigation.
+
+## Update 2026-08-17: `vkgears -fullscreen` tearing -- 2-image swapchains are unsafe
+
+`vkgears -fullscreen` (the system `/usr/bin/vkgears`, distinct from the
+`gears`/`vkcube` demos used throughout this doc) kept tearing under
+`FLIP_TEST_GOB_REAL` even with the compositor off, while `gears`/`vkcube`
+were tear-free. Continuous/recurring, not a one-off.
+
+Two theories were investigated and **ruled out**:
+
+- **Missing `BLOCKLINEAR` flag on vkgears' flips**: an early kprobe capture
+  was misread -- `args.flags` (the top-level `struct tegra_dc_ext_flip_4`
+  byte, always 0 for our calls) was mistaken for `win.flags` (the per-window
+  field that actually carries `TEGRA_DC_EXT_FLIP_FLAG_BLOCKLINEAR`, `1<<5`).
+  Re-running the kprobe and reading the correct field showed both `gears`
+  and `vkgears` correctly get `flags=32 blockh=4` -- BLOCKLINEAR was never
+  the problem.
+- **Orphaned worker thread from `vkgears`' windowed→fullscreen swapchain
+  recreation**: `vkgears` creates a small windowed swapchain first, then
+  recreates it fullscreen; no `DestroySwapchainKHR` was seen logged between
+  the two `CreateSwapchainKHR` calls, suggesting the old swapchain's worker
+  thread/window claim might linger and race the new one.
+  `VkSwapchainCreateInfoKHR::oldSwapchain` handling was added to
+  `layer_CreateSwapchainKHR` (destroys the old swapchain via
+  `layer_DestroySwapchainKHR` before creating the new one) as a fix -- but
+  added diagnostic logging then showed `ci->oldSwapchain` was actually
+  `VK_NULL_HANDLE` the whole time: `vkgears` calls `vkDestroySwapchainKHR`
+  explicitly instead of using `oldSwapchain`, and that call was already
+  reaching our layer correctly. The theory was wrong, but the
+  `oldSwapchain` handling is a real correctness fix for apps that *do* rely
+  on it, so it was kept.
+
+**Actual root cause**: `vkgears` requests `minImageCount=2`;
+`gears`/`vkcube` request 3. With 2 images, each buffer is reused only ~2
+vblanks (~33ms) after its previous flip; with 3, ~3 vblanks (~50ms).
+`TEGRA_DC_EXT_FLIP4` is deferred/kthread-queued in the kernel (confirmed
+from kernel source earlier in this investigation) -- `tegra_dc_ext_flip()`
+queues work and returns immediately, with the actual window-attribute
+apply happening asynchronously in a per-window kthread. Our CPU-side
+backpressure only tracks our own GPU compute-shader work finishing, not
+"the DC's deferred kthread has actually applied the flip and the hardware
+has moved on." At the ~33ms margin the 2-image case provides, that's
+evidently not always enough slack for the deferred kthread to settle
+before we start rewriting that buffer's memory again -- producing a real,
+reproducible tear. The ~50ms margin from 3 images empirically eliminates
+it.
+
+Confirmed via a `FLIP_TEST_MIN_IMAGES` env override (temporary, forced
+`want` up regardless of `ci->minImageCount`): `FLIP_TEST_MIN_IMAGES=3
+vkgears -fullscreen` ran tear-free. Since a 2-image swapchain is
+apparently unsafe with this layer's architecture regardless of which app
+asks for it, this was made the permanent default rather than an opt-in
+flag: `MIN_IMAGES` (`flip_layer.c`) is now `3`, not `2`. Vulkan apps are
+required to handle the driver returning more images than requested (they
+must query the real count via `vkGetSwapchainImagesKHR`), so this is a
+safe, spec-compliant floor. `FLIP_TEST_MIN_IMAGES` remains available as an
+opt-in override for forcing *even more* images than 3, for further margin
+testing.
+
+Not yet root-caused at the kernel-timing level *why* ~33ms specifically
+isn't enough (vs. some other deferred-kthread latency bound that could be
+fixed at the source instead of worked around with more buffering) -- the
+3-image floor is a confirmed, shipped fix, not a full explanation.

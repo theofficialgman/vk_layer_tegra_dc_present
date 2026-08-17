@@ -410,8 +410,13 @@ static bool lib_load(void) {
 #define LAYER_VERSION         2
 #define LAYER_DESC            "Tegra L4T r32.x Vulkan→GL X11 present relay"
 
-/* Clamp image counts to a sane range. */
-#define MIN_IMAGES   2
+/* Clamp image counts to a sane range. MIN_IMAGES is 3, not 2: empirically
+ * (2026-08-17, vkgears -fullscreen, which requests 2) a 2-image swapchain
+ * ties buffer reuse to a ~33ms/2-vblank gap, which isn't enough margin for
+ * FLIP4's deferred kthread-queued flip to reliably finish before we start
+ * overwriting that slot again, causing a real recurring tear. 3 images
+ * (~50ms/3-vblank gap) fixed it with no other change. See README.md. */
+#define MIN_IMAGES   3
 #define MAX_IMAGES   8
 
 /* Default image count if the app requests something outside the range. */
@@ -1131,6 +1136,12 @@ static Swapchain *as_swapchain(VkSwapchainKHR s) {
 
 static void track_swapchain(Swapchain *sc);
 static void untrack_swapchain(Swapchain *sc);
+/* Forward-declared so layer_CreateSwapchainKHR can call it for
+   ci->oldSwapchain cleanup (recreation handling) before its own definition
+   later in the file. */
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL
+layer_DestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain,
+                           const VkAllocationCallbacks *pAlloc);
 
 /* ----------------------------------------------------------------------- */
 /* GLX helpers                                                             */
@@ -3027,6 +3038,23 @@ layer_CreateSwapchainKHR(VkDevice device,
     DevNode *dev = dev_lookup(dispatch_key(device));
     if (!dev) return VK_ERROR_INITIALIZATION_FAILED;
 
+    /* FLIP_TEST: recreation (e.g. windowed -> fullscreen, a common trigger)
+     * was never handled -- ci->oldSwapchain was silently ignored, leaving
+     * its worker thread alive and its /dev/tegra_dc_N fd + hardware window
+     * claim orphaned. A NEW swapchain then successfully claims the SAME
+     * physical window via its OWN fd (GET_WINDOW doesn't prevent a second
+     * claim from the same process), leaving two independent, actively-
+     * flipping worker threads racing to present to one hardware window --
+     * found 2026-08-16 via vkgears (which resizes windowed->fullscreen on
+     * startup; gears/vkcube never recreate, so this never surfaced before).
+     * layer_DestroySwapchainKHR already safely falls through to the native
+     * ICD's destroy if the handle isn't one of ours (as_swapchain() checks
+     * a magic number first), so it's safe to call unconditionally here. */
+    if (ci->oldSwapchain != VK_NULL_HANDLE) {
+        LOG_INFO("CreateSwapchainKHR: oldSwapchain=%p present, cleaning it up first", (void *)ci->oldSwapchain);
+        layer_DestroySwapchainKHR(device, ci->oldSwapchain, pAlloc);
+    }
+
     Surface *surf = as_surface(ci->surface);
 
     /* Non-NVIDIA passthrough device: forward to the ICD using the real ICD
@@ -3057,8 +3085,18 @@ layer_CreateSwapchainKHR(VkDevice device,
         return dev->d.CreateSwapchainKHR(device, ci, pAlloc, pOut);
     }
 
-    /* Clamp image count to our range. */
+    /* Clamp image count to our range (MIN_IMAGES=3, see its definition).
+     * FLIP_TEST_MIN_IMAGES: optional override to force even more images
+     * than requested, for further margin testing. */
     uint32_t want = ci->minImageCount;
+    {
+        static long force_min = -1;
+        if (force_min < 0) {
+            const char *e = getenv("FLIP_TEST_MIN_IMAGES");
+            force_min = e ? atol(e) : 0;
+        }
+        if (force_min > 0 && (uint32_t)force_min > want) want = (uint32_t)force_min;
+    }
     if (want < MIN_IMAGES) want = MIN_IMAGES;
     if (want > MAX_IMAGES) want = MAX_IMAGES;
 
@@ -3454,6 +3492,7 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL
 layer_DestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain,
                            const VkAllocationCallbacks *pAlloc) {
     if (!swapchain) return;
+    LOG_INFO("DestroySwapchainKHR: swapchain=%p", (void *)swapchain);
     Swapchain *sc = as_swapchain(swapchain);
     DevNode *dev = dev_lookup(dispatch_key(device));
     if (!sc) { if (dev) dev->d.DestroySwapchainKHR(device, swapchain, pAlloc); return; }
