@@ -130,6 +130,7 @@
 #include <X11/Xlib.h>
 #include <X11/Xlib-xcb.h>
 #include <X11/Xatom.h>
+#include <X11/extensions/Xrandr.h>
 #include <xcb/xcb.h>
 #include <dlfcn.h>
 #include <sys/ioctl.h>
@@ -215,7 +216,23 @@
     M(XGetWindowAttributes, Status, (Display *, Window, XWindowAttributes *)) \
     M(XResizeWindow,     int,     (Display *, Window, unsigned, unsigned)) \
     M(XFlush,            int,     (Display *)) \
-    M(XChangeProperty,   int,     (Display *, Window, Atom, Atom, int, int, const unsigned char *, int))
+    M(XChangeProperty,   int,     (Display *, Window, Atom, Atom, int, int, const unsigned char *, int)) \
+    M(XTranslateCoordinates, Bool, (Display *, Window, Window, int, int, int *, int *, Window *))
+
+/* FLIP_TEST: runtime DC auto-detection (detect_dc_for_window). Resolved the
+ * same dlopen+dlsym way as X11_FUNCS, for the same reason (avoids the
+ * Vulkan-loader-mutex deadlock from link-time DT_NEEDED, see the block
+ * comment above) -- libXrandr.so is not required for the rest of this file
+ * to work, so its absence is handled gracefully (detect_dc_for_window
+ * checks for NULL function pointers and returns -1, same as any other
+ * detection failure), unlike libX11/libGL which are hard requirements. */
+#define XRANDR_FUNCS(M) \
+    M(XRRGetScreenResourcesCurrent, XRRScreenResources*, (Display *, Window)) \
+    M(XRRFreeScreenResources,       void,                (XRRScreenResources *)) \
+    M(XRRGetCrtcInfo,               XRRCrtcInfo*,        (Display *, XRRScreenResources *, RRCrtc)) \
+    M(XRRFreeCrtcInfo,              void,                (XRRCrtcInfo *)) \
+    M(XRRGetOutputInfo,             XRROutputInfo*,      (Display *, XRRScreenResources *, RROutput)) \
+    M(XRRFreeOutputInfo,            void,                (XRROutputInfo *))
 
 /* Only glViewport survives here -- everything else this macro used to
  * declare (texture/shader/buffer/program functions) belonged to the GL
@@ -242,18 +259,21 @@
 X11_FUNCS(DECL_TYPEDEF)
 GL_FUNCS (DECL_TYPEDEF)
 GLX_FUNCS(DECL_TYPEDEF)
+XRANDR_FUNCS(DECL_TYPEDEF)
 #undef DECL_TYPEDEF
 
 /* The pointer table, populated by lib_load(). */
 typedef struct {
     void *handle_x11;
     void *handle_gl;
+    void *handle_xrandr;
     void *handle_glx;
     bool  loaded;
 #define DECL_FIELD(name, ret, args) PFN_##name name;
     X11_FUNCS(DECL_FIELD)
     GL_FUNCS (DECL_FIELD)
     GLX_FUNCS(DECL_FIELD)
+    XRANDR_FUNCS(DECL_FIELD)
 #undef DECL_FIELD
 } LibTable;
 
@@ -278,6 +298,11 @@ static bool lib_load(void) {
     if (!g_libs.handle_gl)  g_libs.handle_gl  = dlopen("libGL.so",    RTLD_LAZY | RTLD_GLOBAL);
     g_libs.handle_glx = dlopen("libGLX.so.0", RTLD_LAZY | RTLD_GLOBAL);
     if (!g_libs.handle_glx) g_libs.handle_glx = g_libs.handle_gl;  /* libGL provides glX* on most stacks */
+    /* FLIP_TEST: libXrandr for DC auto-detection -- not a hard requirement,
+     * missing it just means detect_dc_for_window() returns -1 (caller
+     * falls back to its own default). */
+    g_libs.handle_xrandr = dlopen("libXrandr.so.2", RTLD_LAZY | RTLD_GLOBAL);
+    if (!g_libs.handle_xrandr) g_libs.handle_xrandr = dlopen("libXrandr.so", RTLD_LAZY | RTLD_GLOBAL);
 
     if (!g_libs.handle_x11 || !g_libs.handle_gl) {
         fprintf(stderr, "[" "VK_LAYER_TEGRA_x11_present" "] lib_load: failed to dlopen libX11/libGL (%s)\n",
@@ -298,12 +323,16 @@ static bool lib_load(void) {
     g_libs.name = (PFN_##name)dlsym(g_libs.handle_glx, #name); \
     if (!g_libs.name) g_libs.name = (PFN_##name)dlsym(g_libs.handle_gl, #name); \
     if (!g_libs.name) g_libs.name = (PFN_##name)dlsym(RTLD_DEFAULT, #name);
+#define RESOLVE_XRANDR(name, ret, args) \
+    if (g_libs.handle_xrandr) g_libs.name = (PFN_##name)dlsym(g_libs.handle_xrandr, #name);
     X11_FUNCS(RESOLVE_X11)
     GL_FUNCS (RESOLVE_GL)
     GLX_FUNCS(RESOLVE_GLX)
+    XRANDR_FUNCS(RESOLVE_XRANDR)
 #undef RESOLVE_X11
 #undef RESOLVE_GL
 #undef RESOLVE_GLX
+#undef RESOLVE_XRANDR
 
     /* Now that XInitThreads is resolved, call it before any other Xlib
        function fires. Xlib requires this to enable its internal locking
@@ -343,6 +372,14 @@ static bool lib_load(void) {
 #define XResizeWindow             (g_libs.XResizeWindow)
 #define XFlush                    (g_libs.XFlush)
 #define XChangeProperty           (g_libs.XChangeProperty)
+#define XTranslateCoordinates     (g_libs.XTranslateCoordinates)
+
+#define XRRGetScreenResourcesCurrent (g_libs.XRRGetScreenResourcesCurrent)
+#define XRRFreeScreenResources       (g_libs.XRRFreeScreenResources)
+#define XRRGetCrtcInfo                (g_libs.XRRGetCrtcInfo)
+#define XRRFreeCrtcInfo                (g_libs.XRRFreeCrtcInfo)
+#define XRRGetOutputInfo              (g_libs.XRRGetOutputInfo)
+#define XRRFreeOutputInfo             (g_libs.XRRFreeOutputInfo)
 
 #define glViewport                (g_libs.glViewport)
 
@@ -988,6 +1025,8 @@ typedef struct Swapchain {
 
     /* FLIP_TEST: direct FLIP4 present backend state (no-GL version). */
     int      flip_dc_fd;
+    int      flip_win_index; /* FLIP_TEST_WIN, default FLIP_TEST_WIN_INDEX --
+                                 see the comment where flip_dc_fd is opened */
     VkCommandPool flip_cpool;
     uint32_t flip_out_w, flip_out_h; /* clamped to fit the screen, 1:1 */
     bool     flip_ready;
@@ -1629,7 +1668,7 @@ static void *worker_thread_main(void *arg) {
             }
 
             struct tegra_dc_ext_flip_windowattr win = {0};
-            win.index = FLIP_TEST_WIN_INDEX;
+            win.index = sc->flip_win_index;
             /* tegra_dc_ext_pin_window() (util.c) resolves buff_id via
              * dma_buf_get(fd) against the CALLING PROCESS's own fd table --
              * it wants a dma-buf fd, not an nvmap handle number. This is
@@ -1803,7 +1842,7 @@ static void *worker_thread_main(void *arg) {
         /* Disable the window before tearing down -- leaves no visible
          * leftover content on screen. */
         struct tegra_dc_ext_flip_windowattr win = {0};
-        win.index = FLIP_TEST_WIN_INDEX;
+        win.index = sc->flip_win_index;
         win.buff_id = 0;
         win.pre_syncpt_id = FLIP_TEST_NVSYNCPT_INVALID;
         struct tegra_dc_ext_flip_4 flip = {0};
@@ -2579,6 +2618,74 @@ fail_buf:
     return false;
 }
 
+/* Figure out which /dev/tegra_dc_N drives the monitor `win` is actually on,
+ * via XRandR -- portable and driver-agnostic right up to the last step,
+ * which needs a hardware-specific output-name -> DC-number mapping (no
+ * public NVIDIA/tegra_dc ioctl or X11 property exposes this directly on
+ * this driver; checked `xrandr --props` for a Tegra-specific property,
+ * none exists). That mapping is fixed by this SoC's physical display
+ * wiring (which connector goes to which DC), not something that changes
+ * at runtime -- re-verify (add a case here) if this ever runs on
+ * different hardware. Returns -1 (caller uses its own default) if
+ * detection fails at any step, including an unrecognized output name. */
+static int detect_dc_for_window(Display *dpy, Window win) {
+    if (!XRRGetScreenResourcesCurrent || !XRRGetCrtcInfo ||
+        !XRRGetOutputInfo || !XTranslateCoordinates) {
+        LOG_WARN("FLIP_TEST: libXrandr not available, cannot auto-detect DC");
+        return -1;
+    }
+    Window root;
+    int wx, wy; unsigned int ww, wh, wb, wd;
+    if (!XGetGeometry(dpy, win, &root, &wx, &wy, &ww, &wh, &wb, &wd))
+        return -1;
+    int abs_x, abs_y;
+    Window child;
+    if (!XTranslateCoordinates(dpy, win, root, 0, 0, &abs_x, &abs_y, &child))
+        return -1;
+
+    XRRScreenResources *res = XRRGetScreenResourcesCurrent(dpy, root);
+    if (!res) return -1;
+
+    /* Find the active CRTC with the largest rectangle overlap against the
+       window -- the standard portable way to determine "which monitor is
+       this window mostly on" (handles the window spanning two monitors,
+       or not being perfectly positioned, gracefully). */
+    long best_overlap = -1;
+    RRCrtc best_crtc = None;
+    for (int i = 0; i < res->ncrtc; i++) {
+        XRRCrtcInfo *ci = XRRGetCrtcInfo(dpy, res, res->crtcs[i]);
+        if (!ci) continue;
+        if (ci->width > 0 && ci->height > 0) {
+            int ox1 = abs_x, oy1 = abs_y;
+            int ox2 = abs_x + (int)ww, oy2 = abs_y + (int)wh;
+            int cx1 = ci->x, cy1 = ci->y;
+            int cx2 = ci->x + (int)ci->width, cy2 = ci->y + (int)ci->height;
+            int ix1 = ox1 > cx1 ? ox1 : cx1, iy1 = oy1 > cy1 ? oy1 : cy1;
+            int ix2 = ox2 < cx2 ? ox2 : cx2, iy2 = oy2 < cy2 ? oy2 : cy2;
+            long overlap = (ix2 > ix1 && iy2 > iy1) ? (long)(ix2 - ix1) * (long)(iy2 - iy1) : 0;
+            if (overlap > best_overlap) { best_overlap = overlap; best_crtc = res->crtcs[i]; }
+        }
+        XRRFreeCrtcInfo(ci);
+    }
+
+    int result = -1;
+    if (best_crtc != None) {
+        XRRCrtcInfo *ci = XRRGetCrtcInfo(dpy, res, best_crtc);
+        if (ci && ci->noutput > 0) {
+            XRROutputInfo *oi = XRRGetOutputInfo(dpy, res, ci->outputs[0]);
+            if (oi) {
+                if (strcmp(oi->name, "DSI-0") == 0) result = 0;      /* internal panel */
+                else if (strcmp(oi->name, "DP-0") == 0) result = 1;  /* external/dock */
+                LOG_INFO("FLIP_TEST: window is on output '%s' -> %s",
+                         oi->name, result >= 0 ? "recognized" : "UNRECOGNIZED (add a case in detect_dc_for_window)");
+                XRRFreeOutputInfo(oi);
+            }
+        }
+        if (ci) XRRFreeCrtcInfo(ci);
+    }
+    XRRFreeScreenResources(res);
+    return result;
+}
 
 static void destroy_perimage(DevNode *dev, Swapchain *sc, PerImage *pi) {
     DeviceDispatch *d = &dev->d;
@@ -3043,13 +3150,51 @@ layer_CreateSwapchainKHR(VkDevice device,
     sc->flip_out_w = sc->extent.width  > 2560 ? 2560 : sc->extent.width;
     sc->flip_out_h = sc->extent.height > 1600 ? 1600 : sc->extent.height;
 
-    sc->flip_dc_fd = open("/dev/tegra_dc_1", O_RDWR);
+    /* Which DC device and window index to target. Hardcoded to tegradc.1 /
+     * window 1 for this entire prototype's history (confirmed free of
+     * Xorg ownership specifically on DC1 -- see README safety notes) --
+     * made runtime-detected 2026-08-16 after discovering the hardcoding
+     * meant this file could only ever touch DC1, regardless of which
+     * monitor the app's window was actually on. Default: auto-detect via
+     * XRandR (detect_dc_for_window) which physical output the window is
+     * on, mapped through a small hardware-specific table (this SoC's
+     * fixed DSI-0->DC0 / DP-0->DC1 wiring). FLIP_TEST_DC, if set,
+     * overrides detection entirely (useful for forcing a specific DC
+     * while testing). Falls back to 1 (the historical default) if
+     * detection fails for any reason. Window ownership has only been
+     * verified on DC1 -- do not assume window 1 is free on a different
+     * DC without checking first (see README). */
+    int flip_dc_num;
+    {
+        const char *e = getenv("FLIP_TEST_DC");
+        if (e) {
+            flip_dc_num = atoi(e);
+            LOG_INFO("FLIP_TEST: DC%d forced via FLIP_TEST_DC", flip_dc_num);
+        } else {
+            flip_dc_num = detect_dc_for_window(surf->dpy, surf->window);
+            if (flip_dc_num < 0) {
+                LOG_WARN("FLIP_TEST: DC auto-detection failed, falling back to DC1");
+                flip_dc_num = 1;
+            }
+        }
+    }
+    int flip_win_index = FLIP_TEST_WIN_INDEX;
+    {
+        const char *e = getenv("FLIP_TEST_WIN");
+        flip_win_index = e ? atoi(e) : FLIP_TEST_WIN_INDEX;
+    }
+    char flip_dc_path[32];
+    snprintf(flip_dc_path, sizeof(flip_dc_path), "/dev/tegra_dc_%d", flip_dc_num);
+    LOG_INFO("FLIP_TEST: targeting %s window %d", flip_dc_path, flip_win_index);
+    sc->flip_win_index = flip_win_index;
+
+    sc->flip_dc_fd = open(flip_dc_path, O_RDWR);
     if (sc->flip_dc_fd < 0) {
-        LOG_ERR("FLIP_TEST: open tegra_dc_1 failed: %m");
+        LOG_ERR("FLIP_TEST: open %s failed: %m", flip_dc_path);
         goto fail_perimg;
     }
-    if (ioctl(sc->flip_dc_fd, TEGRA_DC_EXT_GET_WINDOW, (unsigned long)FLIP_TEST_WIN_INDEX) < 0) {
-        LOG_ERR("FLIP_TEST: GET_WINDOW %d failed: %m", FLIP_TEST_WIN_INDEX);
+    if (ioctl(sc->flip_dc_fd, TEGRA_DC_EXT_GET_WINDOW, (unsigned long)flip_win_index) < 0) {
+        LOG_ERR("FLIP_TEST: GET_WINDOW %d on %s failed: %m", flip_win_index, flip_dc_path);
         goto fail_perimg;
     }
 
@@ -3229,7 +3374,7 @@ layer_CreateSwapchainKHR(VkDevice device,
         }
     }
     LOG_INFO("FLIP_TEST: ready, window %d, out %ux%u",
-             FLIP_TEST_WIN_INDEX, sc->flip_out_w, sc->flip_out_h);
+             sc->flip_win_index, sc->flip_out_w, sc->flip_out_h);
 
     /* Release the GLX context from this thread before the worker takes it. */
     glXMakeCurrent(surf->dpy, None, NULL);

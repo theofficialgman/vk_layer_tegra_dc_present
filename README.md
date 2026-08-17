@@ -180,6 +180,17 @@ Optional env vars (all default to off/baseline if unset):
   blocking kernel syncpoint wait, targeting every `N`th vblank (`1` =
   ~60fps, `2` = ~30fps). Takes priority over `FLIP_TEST_KERNEL_WAIT` if
   both are set.
+- `FLIP_TEST_BLOCKLINEAR=1` / `FLIP_TEST_SOLID_FILL=1` / `FLIP_TEST_GOB_PROBE=<1|2>`
+  / `FLIP_TEST_GOB_REAL=1` / `FLIP_TEST_BLOCKHEIGHT_LOG2=<N>` /
+  `FLIP_TEST_GOB_ORDER=<0|1|2>` -- the block-linear investigation and its
+  resolution, see "Update 2026-08-16" parts 1-3 below for what each does.
+  `FLIP_TEST_GOB_REAL=1` is the complete, working, tear-free-with-correct-
+  content path.
+- `FLIP_TEST_DC=<N>` -- force a specific `/dev/tegra_dc_<N>`, overriding
+  the default XRandR-based auto-detection of which DC drives the window's
+  current monitor. `FLIP_TEST_WIN=<N>` (default 1) -- window index. See
+  "Update 2026-08-16 parts 5-6" -- window ownership has only been verified
+  on DC1; re-check before pointing this at a different DC.
 
 Safety notes if you're poking at this again:
 - Targets window index 1 on `tegradc.1` — confirmed free (Xorg owns window
@@ -574,6 +585,64 @@ vs. the ~2700 fds that would have leaked in that time before the fix.
   prototype proves the mechanism works; porting it into the production
   layer (replacing the GL/GLX bridge, or offering it as an alternative
   path) is a separate, not-yet-started effort.
+
+## Update 2026-08-16 part 5: DC device and window index made configurable
+
+`/dev/tegra_dc_1` and window index `1` were hardcoded for this entire
+prototype's history (this device confirmed free of Xorg ownership
+specifically on DC1 -- see the safety notes near the top). This meant the
+file could only ever target DC1 (the external/dock output, `DP-0` in
+`xrandr`), regardless of intent -- surfaced when testing against the
+internal panel (`DSI-0`, DC0) produced no visible result and `dmesg` showed
+DC1 activity instead. Two separate things were going on: the hardcoding
+(now fixed, see below), and the internal display being disabled at the X11
+level at the time (`DC0 ... enabled=0` per the earlier `GET_STATUS` kprobe
+capture, confirmed via `xrandr` showing `DSI-0 connected` with no active
+mode) -- independent of anything in this file, a flip to a disabled DC
+isn't expected to produce visible output no matter what device path is
+used.
+
+`FLIP_TEST_WIN=<N>` (default 1, same as the old hardcoded
+`FLIP_TEST_WIN_INDEX`) selects the window index at runtime, stored on
+`sc->flip_win_index` for the worker thread to use consistently. **Window
+ownership has only ever been verified on DC1** -- window 1 being free
+there doesn't guarantee it's free on DC0 or any other DC; re-check
+(`GET_WINDOW`, or the debugfs `window_toggle` trick from the original
+investigation) before pointing this at a different DC.
+
+**Superseded later the same day** -- see part 6 below: the DC device
+itself is now auto-detected at runtime instead of needing
+`FLIP_TEST_DC` set by hand.
+
+## Update 2026-08-16 part 6: DC auto-detection via XRandR
+
+Runtime auto-detection: `detect_dc_for_window()` uses XRandR
+(`XRRGetScreenResourcesCurrent`/`XRRGetCrtcInfo`/`XRRGetOutputInfo`) to find
+which physical output the app's actual window is currently on (by root-
+relative rectangle overlap against each active CRTC -- the standard
+portable "which monitor is this window on" technique), then maps the
+output's name through a small hardware-specific table (`DSI-0` -> DC0,
+`DP-0` -> DC1 -- fixed by this SoC's physical display wiring, not something
+that changes at runtime; no Tegra-specific X11 property or public
+`tegra_dc_ext` ioctl exposes this mapping directly, checked `xrandr --props`
+for one and found only generic/KDE properties). `FLIP_TEST_DC=<N>`, if set,
+still overrides detection entirely (forces a specific DC regardless of
+which output the window is on -- useful for testing). Falls back to DC1 if
+detection fails for any reason (no XRandR, unrecognized output name, etc.).
+
+Implementation note: `XTranslateCoordinates` and the `XRR*` functions are
+resolved through the *same* dlopen+dlsym indirection as every other X11/GL/
+GLX call in this file (see the big block comment near the top on the
+Vulkan-loader-mutex deadlock this avoids) -- `libXrandr.so` is opened
+alongside libX11/libGL/libGLX in `lib_load()`, but treated as optional
+(missing it just disables auto-detection, doesn't fail setup) unlike the
+other two, which are hard requirements.
+
+Verified: with the dock connected (`DP-0` active), auto-detection correctly
+logs `window is on output 'DP-0' -> recognized` and targets
+`/dev/tegra_dc_1` window 1, identical to every prior test in this file, and
+live end-to-end behavior (real content, tear-free) is unaffected by this
+change.
 
 Since that closed blob still has to talk to the *open* kernel driver to get
 pixels on screen, its ioctl traffic is the one part of it that's still
