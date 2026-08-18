@@ -3641,15 +3641,23 @@ layer_CreateSwapchainKHR(VkDevice device,
                  sc->flip_gob_probe == 2 ? "ENABLED, mode 2 (candidate swizzle verification)" : "disabled");
     }
 
-    /* FLIP_TEST_GOB_REAL=1: see the flip_gob_real comment on the Swapchain
+    /* FLIP_TEST_GOB_REAL: see the flip_gob_real comment on the Swapchain
      * struct -- real per-frame content through the verified GOB block-
      * linear compute shader, combining correct content with the causally-
-     * verified tear-free BLOCKLINEAR path. */
+     * verified tear-free BLOCKLINEAR path. Defaults ON as of 2026-08-17:
+     * this is the confirmed, tear-free, correct-content path every real
+     * app in this investigation (gears, vkcube, vkgears, dolphin-emu, the
+     * Play emulator) has been tested and fixed against -- there's no
+     * longer a reason to require opting into it explicitly. Set
+     * FLIP_TEST_GOB_REAL=0 to fall back to the plain LINEAR detile target
+     * (create_flip_export_image) or FLIP_TEST_BLOCKLINEAR's retest path,
+     * both still available for diagnostic use -- see the option reference
+     * near the top of README.md. */
     {
         static int gob_real = -1;
         if (gob_real < 0) {
             const char *e = getenv("FLIP_TEST_GOB_REAL");
-            gob_real = (e && atoi(e) != 0) ? 1 : 0;
+            gob_real = e ? (atoi(e) != 0 ? 1 : 0) : 1;
         }
         sc->flip_gob_real = gob_real != 0;
         static long bhl2 = -1;

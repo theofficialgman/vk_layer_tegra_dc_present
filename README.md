@@ -18,6 +18,102 @@ appropriate for a focused test of one specific thing, not how the real
 production layer should behave. Not integrated with the real layer; runs
 standalone via explicit layer activation, no system install.
 
+## Environment variable reference
+
+Quick-reference for every env var this layer reads. Defaults produce the
+current, confirmed-working, tear-free configuration (real content, GOB
+block-linear, GLX SGI-wait pacing, fullscreen-only) -- everything below is
+either a diagnostic knob from the investigation or an escape hatch, safe
+to leave unset for normal use.
+
+**Core behavior**
+- `VK_TEGRA_X11_PRESENT_DISABLE=1` -- transparent passthrough; the layer
+  does nothing, native Vulkan WSI handles everything (tearing, same as no
+  layer at all). Useful for A/B comparison.
+- `VK_TEGRA_X11_PRESENT_LOG=<0-3>` -- log level: 0 silent, 1 warn/err,
+  2 info (recommended for normal runs), 3 debug.
+- `VK_TEGRA_X11_PRESENT_LOG_FILE=<path>` -- also append the log to a file.
+- `VK_TEGRA_X11_PRESENT_DIAG=1` -- calls `vkDeviceWaitIdle` after every
+  single `vkQueueSubmit` (ours and the app's), logging a sequence number
+  for each. Pinpoints exactly which submit faults instead of letting a GPU
+  fault surface later as `DEVICE_LOST` on some unrelated call. Extremely
+  slow (every submit becomes synchronous) -- one-shot fault localization
+  only, not for normal runs.
+
+**Content path** (default: real content, GOB block-linear, tear-free)
+- `FLIP_TEST_GOB_REAL=0` -- disable the default. Real per-frame content
+  through the verified GOB block-linear compute shader is what every app
+  in this investigation (gears, vkcube, vkgears, dolphin-emu, the Play
+  emulator) has been tested and fixed against; there's no longer a reason
+  to opt out except to compare against the older paths below.
+- `FLIP_TEST_BLOCKLINEAR=1` -- (only takes effect with `FLIP_TEST_GOB_REAL=0`)
+  retest FLIP4 against a raw `BLOCKLINEAR`-flagged `OPTIMAL` image
+  directly, bypassing the GOB compute shader entirely. Historical: this is
+  what first proved BLOCKLINEAR itself is tear-free, before the correct
+  swizzle formula was derived (see "Update 2026-08-16" parts 1-2) -- the
+  content it produces is visually wrong (untiled), useful only for
+  re-confirming tearing behavior in isolation.
+- `FLIP_TEST_SOLID_FILL=1` -- alternating solid-color fill instead of real
+  content, isolating tearing-causality from content-correctness.
+  `FLIP_TEST_SOLID_FILL_PERIOD=<N>` overrides the toggle frequency
+  (default 20 frames, ~0.33s at 60fps).
+- `FLIP_TEST_GOB_PROBE=<1|2>` -- diagnostic patterns used to derive/verify
+  the GOB tiling formula: mode 1 writes a coordinate-revealing pattern to
+  a LINEAR buffer flagged BLOCKLINEAR (reveals the DC's real permutation
+  empirically); mode 2 writes a candidate swizzle and checks whether
+  BLOCKLINEAR-flagged FLIP4 reconstructs a clean gradient. Not for normal
+  use -- see "Update 2026-08-16 part 2".
+- `FLIP_TEST_BLOCKHEIGHT_LOG2=<N>` -- override the block-linear
+  `block_height_log2` (default 4).
+- `FLIP_TEST_GOB_ORDER=<0|1|2>` -- only relevant under
+  `FLIP_TEST_GOB_PROBE=2`; historical hypothesis-testing knob for GOB
+  ordering within a block (0 row-major, 1 column-major -- confirmed
+  correct, 2 Morton/Z-order interleave). Not used by the real GOB_REAL
+  path, which hardcodes the confirmed-correct column-major order.
+
+**Window / DC targeting**
+- `FLIP_TEST_DC=<N>` -- force `/dev/tegra_dc_<N>`, overriding the default
+  XRandR-based auto-detection of which DC drives the window's current
+  monitor.
+- `FLIP_TEST_WIN=<N>` -- force the DC window (hardware overlay plane)
+  index (default 1). Ownership has only been verified free on DC1 window
+  1 -- do not point this at a different DC/window without checking first.
+- `FLIP_TEST_ALLOW_WINDOWED=1` -- override the fullscreen gate (see
+  "Update 2026-08-17 part 4") to test the FLIP4 path itself against a
+  non-fullscreen window. The overlay's position will be wrong and it won't
+  respect window occlusion -- diagnostic only, never for normal use.
+
+**Buffering / pacing**
+- `FLIP_TEST_MIN_IMAGES=<N>` -- force at least `N` swapchain images. The
+  built-in floor is already 3 (raised from 2 after "2-image swapchains are
+  unsafe", see "Update 2026-08-17"); this only matters for testing higher
+  counts.
+- `FLIP_TEST_FORCE_FIFO=1` -- force FIFO present mode regardless of what
+  the app requests, for isolating whether a bug is specific to MAILBOX's
+  displaced-image bookkeeping (see "Update 2026-08-17 part 3").
+- `FLIP_TEST_KERNEL_WAIT=1` -- Option 1: adds a hardware `pre_syncpt_id`
+  latch gate on top of the default GLX SGI wait. `FLIP_TEST_SYNCPT_OFFSET=<N>`
+  overrides its target delta (default 1); large values (e.g. 300) are a
+  proof-of-execution stall test, not a normal mode.
+- `FLIP_TEST_KERNEL_PACE=<N>` -- Option 1b: fully GLX-free pacing via a
+  blocking kernel syncpoint wait targeting every `N`th vblank (1 = ~60fps,
+  2 = ~30fps); takes priority over `FLIP_TEST_KERNEL_WAIT` if both are
+  set. Note a GLX context is still created and made current regardless --
+  this only changes the pacing wait itself, not the rest of the swapchain
+  setup. **Tested 2026-08-17 with `FLIP_TEST_GOB_REAL=1`: tears for the
+  first few seconds before settling, worse than the default GLX SGI wait.**
+  Kept for reference; not recommended over the default.
+- `FLIP_TEST_DELAY_US=<us>` -- extra sleep inserted right before `FLIP4`,
+  after the SGI wait. Used for a manual vblank-phase timing sweep.
+
+**Debugging**
+- `FLIP_TEST_TRACE_SYNC=1` -- logs a global sequence-numbered trace of
+  every touch of the per-image `vk_render_done`/`gl_sample_done`
+  semaphores, tagged with the calling thread's TID. Built to chase the
+  MAILBOX displaced-image race (see "Update 2026-08-17 part 3") by
+  reconstructing real interleaving instead of guessing from code reading.
+  Very verbose -- one line per semaphore touch, every frame.
+
 ## ⚠️ Superseded 2026-08-16 — see "Update" section below
 
 The result and conclusion immediately below (originally titled "the hypothesis
@@ -159,38 +255,19 @@ specific reverse-engineered constants) rather than the sole fix.
 ## Build & run (explicit layer, no system install)
 
 ```sh
-gcc -O0 -g -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers \
+gcc -O2 -g -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers \
     -fPIC -fvisibility=hidden -shared -Wl,--no-undefined -Wl,--version-script=flip_layer.map \
     -I. -o libVkLayer_flip_test.so flip_layer.c -lpthread -ldl
 
 VK_LAYER_PATH=$(pwd) VK_INSTANCE_LAYERS=VK_LAYER_FLIP_test VK_TEGRA_X11_PRESENT_LOG=2 \
-    ~/Vulkan/build/bin/gears -vs        # windowed
-    # or: ~/Vulkan/build/bin/gears -f -vs   # fullscreen
+    ~/Vulkan/build/bin/gears -vs        # windowed -- falls through to native WSI, see part 4
+    # or: ~/Vulkan/build/bin/gears -f -vs   # fullscreen -- engages FLIP4, tear-free by default
 ```
 
-Optional env vars (all default to off/baseline if unset):
-- `FLIP_TEST_DELAY_US=<us>` -- extra sleep inserted right before `FLIP4`,
-  after the SGI wait. Used for the manual timing sweep.
-- `FLIP_TEST_KERNEL_WAIT=1` -- Option 1: adds the hardware `pre_syncpt_id`
-  latch gate on top of the SGI wait (see "Option 1 / 1b" below).
-  `FLIP_TEST_SYNCPT_OFFSET=<N>` overrides its target delta (default 1);
-  large values (e.g. 300) are a proof-of-execution stall test, not a
-  normal mode -- see below before using it.
-- `FLIP_TEST_KERNEL_PACE=<N>` -- Option 1b: fully GLX-free pacing via a
-  blocking kernel syncpoint wait, targeting every `N`th vblank (`1` =
-  ~60fps, `2` = ~30fps). Takes priority over `FLIP_TEST_KERNEL_WAIT` if
-  both are set.
-- `FLIP_TEST_BLOCKLINEAR=1` / `FLIP_TEST_SOLID_FILL=1` / `FLIP_TEST_GOB_PROBE=<1|2>`
-  / `FLIP_TEST_GOB_REAL=1` / `FLIP_TEST_BLOCKHEIGHT_LOG2=<N>` /
-  `FLIP_TEST_GOB_ORDER=<0|1|2>` -- the block-linear investigation and its
-  resolution, see "Update 2026-08-16" parts 1-3 below for what each does.
-  `FLIP_TEST_GOB_REAL=1` is the complete, working, tear-free-with-correct-
-  content path.
-- `FLIP_TEST_DC=<N>` -- force a specific `/dev/tegra_dc_<N>`, overriding
-  the default XRandR-based auto-detection of which DC drives the window's
-  current monitor. `FLIP_TEST_WIN=<N>` (default 1) -- window index. See
-  "Update 2026-08-16 parts 5-6" -- window ownership has only been verified
-  on DC1; re-check before pointing this at a different DC.
+See the "Environment variable reference" section near the top of this file
+for every env var this layer reads and what it does -- the defaults
+already produce the confirmed-working, tear-free configuration, nothing
+below is required for normal use.
 
 Safety notes if you're poking at this again:
 - Targets window index 1 on `tegradc.1` — confirmed free (Xorg owns window
