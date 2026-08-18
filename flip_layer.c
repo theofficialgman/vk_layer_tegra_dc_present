@@ -1778,6 +1778,14 @@ static void *worker_thread_main(void *arg) {
             win.pixformat = TEGRA_DC_EXT_FMT_T_A8R8G8B8;
             win.w = sc->flip_out_w << 12;
             win.h = sc->flip_out_h << 12;
+            /* out_x/out_y are relative to the target DISPLAY's own origin,
+               not the X11 root window's -- 0,0 is only correct because
+               layer_CreateSwapchainKHR's FULLSCREEN GATE already confirmed
+               this window covers its target CRTC entirely (or the caller
+               explicitly opted out via FLIP_TEST_ALLOW_WINDOWED, in which
+               case this is a known-wrong position, expected for that
+               diagnostic use). Do not remove the gate and expect this to
+               still be correct for a windowed app. */
             win.out_x = 0; win.out_y = 0;
             win.out_w = sc->flip_out_w; win.out_h = sc->flip_out_h;
             win.z = 255;
@@ -2800,7 +2808,19 @@ fail_buf:
  * at runtime -- re-verify (add a case here) if this ever runs on
  * different hardware. Returns -1 (caller uses its own default) if
  * detection fails at any step, including an unrecognized output name. */
-static int detect_dc_for_window(Display *dpy, Window win) {
+/* out_is_fullscreen, if non-NULL, is set to whether the window's size
+ * exactly matches its best-matching CRTC's resolution (not just "close",
+ * e.g. 98% area overlap -- a maximized-but-still-a-regular-window can
+ * cover nearly the whole display too, especially decoration-less/CSD
+ * windows, and must NOT be treated as fullscreen here: unlike true
+ * exclusive fullscreen it's still occludable by other windows, which a
+ * raw hardware overlay plane can't respect). See the FULLSCREEN GATE
+ * comment in layer_CreateSwapchainKHR for why this matters: it's not just
+ * an occlusion nicety, TEGRA_DC_EXT_FLIP4's out_x/out_y are relative to
+ * the target display's own origin, not the X11 root window's, so exactly
+ * matching the CRTC's rect is also what makes out_x=out_y=0 correct. */
+static int detect_dc_for_window(Display *dpy, Window win, bool *out_is_fullscreen) {
+    if (out_is_fullscreen) *out_is_fullscreen = false;
     if (!XRRGetScreenResourcesCurrent || !XRRGetCrtcInfo ||
         !XRRGetOutputInfo || !XTranslateCoordinates) {
         LOG_WARN("FLIP_TEST: libXrandr not available, cannot auto-detect DC");
@@ -2843,13 +2863,19 @@ static int detect_dc_for_window(Display *dpy, Window win) {
     int result = -1;
     if (best_crtc != None) {
         XRRCrtcInfo *ci = XRRGetCrtcInfo(dpy, res, best_crtc);
+        if (ci && out_is_fullscreen) {
+            *out_is_fullscreen = ci->width > 0 && ci->height > 0 &&
+                ww == ci->width && wh == ci->height &&
+                abs_x == ci->x && abs_y == ci->y;
+        }
         if (ci && ci->noutput > 0) {
             XRROutputInfo *oi = XRRGetOutputInfo(dpy, res, ci->outputs[0]);
             if (oi) {
                 if (strcmp(oi->name, "DSI-0") == 0) result = 0;      /* internal panel */
                 else if (strcmp(oi->name, "DP-0") == 0) result = 1;  /* external/dock */
-                LOG_INFO("FLIP_TEST: window is on output '%s' -> %s",
-                         oi->name, result >= 0 ? "recognized" : "UNRECOGNIZED (add a case in detect_dc_for_window)");
+                LOG_INFO("FLIP_TEST: window is on output '%s' -> %s%s",
+                         oi->name, result >= 0 ? "recognized" : "UNRECOGNIZED (add a case in detect_dc_for_window)",
+                         (out_is_fullscreen && *out_is_fullscreen) ? ", fullscreen" : ", windowed");
                 XRRFreeOutputInfo(oi);
             }
         }
@@ -3163,6 +3189,31 @@ layer_GetPhysicalDeviceSurfaceFormats2KHR(VkPhysicalDevice physicalDevice,
 /* Swapchain creation                                                      */
 /* ----------------------------------------------------------------------- */
 
+/* Every "soft fail, fall through to native WSI" path in
+   layer_CreateSwapchainKHR needs this, not just dev->passthrough (which
+   already did it correctly, see above): ci->surface may be OUR OWN fake
+   Surface* wrapper handle (what layer_CreateXlibSurfaceKHR/
+   layer_CreateXcbSurfaceKHR hand back to the app), not a real native
+   surface. Forwarding ci unmodified hands the ICD a pointer to our own
+   struct instead of a real surface object -- it dereferences that as if it
+   were one and crashes (SIGSEGV, confirmed 2026-08-17 the first time a
+   fallback path here became a COMMON case instead of a rare error path --
+   see the FULLSCREEN GATE below). Swap in surf->icd_surface, the real ICD
+   surface this layer always creates alongside its own wrapper, before
+   forwarding. */
+static VkResult fallback_to_native_swapchain(DevNode *dev, VkDevice device,
+                                             const VkSwapchainCreateInfoKHR *ci,
+                                             Surface *surf,
+                                             const VkAllocationCallbacks *pAlloc,
+                                             VkSwapchainKHR *pOut) {
+    if (surf && surf->icd_surface) {
+        VkSwapchainCreateInfoKHR modci = *ci;
+        modci.surface = surf->icd_surface;
+        return dev->d.CreateSwapchainKHR(device, &modci, pAlloc, pOut);
+    }
+    return dev->d.CreateSwapchainKHR(device, ci, pAlloc, pOut);
+}
+
 VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL
 layer_CreateSwapchainKHR(VkDevice device,
                           const VkSwapchainCreateInfoKHR *ci,
@@ -3180,10 +3231,33 @@ layer_CreateSwapchainKHR(VkDevice device,
      * flipping worker threads racing to present to one hardware window --
      * found 2026-08-16 via vkgears (which resizes windowed->fullscreen on
      * startup; gears/vkcube never recreate, so this never surfaced before).
-     * layer_DestroySwapchainKHR already safely falls through to the native
-     * ICD's destroy if the handle isn't one of ours (as_swapchain() checks
-     * a magic number first), so it's safe to call unconditionally here. */
-    if (ci->oldSwapchain != VK_NULL_HANDLE) {
+     *
+     * Only eagerly destroy oldSwapchain here when it's confirmed to be one
+     * of OUR OWN fake FLIP4 structs (as_swapchain() != NULL) -- in that
+     * case the real ICD never knew this handle existed, so fully
+     * destroying it immediately (not merely "retiring" it, which is all
+     * the Vulkan spec actually requires of a CreateSwapchainKHR call) is
+     * exclusively our call to make and is what fixes the orphaned-thread
+     * bug above.
+     *
+     * Previously this ran unconditionally, including when oldSwapchain is
+     * a REAL native handle (from a windowed swapchain that fell through to
+     * native WSI under the FULLSCREEN GATE below). That's a genuine
+     * double-destroy: per spec, oldSwapchain is only retired by this call,
+     * not implicitly destroyed -- the app still owns it and is expected to
+     * call vkDestroySwapchainKHR on it itself afterward (confirmed via
+     * logs: gears -vs does exactly that on every resize). Eagerly fully
+     * destroying it ourselves, THEN also handing the same now-freed handle
+     * unchanged to a real CreateSwapchainKHR call below (which itself also
+     * consumes/retires oldSwapchain internally) crashed the driver --
+     * found 2026-08-17 resizing gears -vs, a windowed app that (correctly,
+     * per the FULLSCREEN GATE) uses the native-WSI fallback path, which
+     * this bug never got exercised against before that gate existed. Not
+     * touching a real handle here and leaving ci->oldSwapchain unchanged
+     * for the eventual CreateSwapchainKHR call (fallback or passthrough)
+     * to consume normally, exactly matches native Vulkan swapchain-
+     * recreation semantics. */
+    if (ci->oldSwapchain != VK_NULL_HANDLE && as_swapchain(ci->oldSwapchain)) {
         LOG_INFO("CreateSwapchainKHR: oldSwapchain=%p present, cleaning it up first", (void *)ci->oldSwapchain);
         layer_DestroySwapchainKHR(device, ci->oldSwapchain, pAlloc);
     }
@@ -3205,7 +3279,7 @@ layer_CreateSwapchainKHR(VkDevice device,
     }
 
     if (g_layer_disabled || !surf)
-        return dev->d.CreateSwapchainKHR(device, ci, pAlloc, pOut);
+        return fallback_to_native_swapchain(dev, device, ci, surf, pAlloc, pOut);
 
     /* Lazy-load libX11, libGL, libGLX. We can't link these in at build time
        because doing so causes a recursive-mutex deadlock inside the Vulkan
@@ -3215,7 +3289,46 @@ layer_CreateSwapchainKHR(VkDevice device,
        mutex is held. lib_load() is idempotent and thread-safe. */
     if (!lib_load()) {
         LOG_ERR("CreateSwapchainKHR: failed to load libGL/libX11; falling through");
-        return dev->d.CreateSwapchainKHR(device, ci, pAlloc, pOut);
+        return fallback_to_native_swapchain(dev, device, ci, surf, pAlloc, pOut);
+    }
+
+    /* FULLSCREEN GATE: only engage the FLIP4 present path for windows that
+       genuinely cover their target display. TEGRA_DC_EXT_FLIP4 presents via
+       a raw hardware overlay plane (see the FLIP_TEST banner comment near
+       the top of this file) -- it composites on top of Xorg's own desktop
+       plane unconditionally, ignoring X11 window stacking, so a windowed
+       (non-fullscreen) app under this layer would (a) always draw on top of
+       whatever else is visually stacked above it, breaking occlusion by
+       other windows, and (b) show at the wrong position, since out_x/out_y
+       below are relative to the target DISPLAY's own origin, not the X11
+       root window's -- correct only when the window covers the display
+       exactly (out_x=out_y=0 by definition, once that's confirmed). Rather
+       than patch the position (easy) while leaving occlusion fundamentally
+       broken (routing through Xorg's own compositing to fix that properly
+       would reintroduce the tearing this whole layer exists to avoid --
+       see README.md), windowed swapchains fall through to native
+       passthrough WSI here, tearing exactly as they would without this
+       layer at all. Every app tested so far (dolphin-emu, vkgears, the Play
+       emulator) already recreates its own swapchain on the windowed ->
+       fullscreen transition, so this naturally engages FLIP4 at exactly the
+       right moment with no extra plumbing needed. FLIP_TEST_ALLOW_WINDOWED=1
+       overrides this for testing the FLIP4 path itself on a non-fullscreen
+       window (e.g. vkcube's default 500x500) -- out_x/out_y will be wrong
+       in that case, expected and fine for that specific purpose. */
+    bool flip_is_fullscreen = false;
+    int flip_detected_dc = detect_dc_for_window(surf->dpy, surf->window, &flip_is_fullscreen);
+    if (!flip_is_fullscreen) {
+        static int allow_windowed = -1;
+        if (allow_windowed < 0) {
+            const char *e = getenv("FLIP_TEST_ALLOW_WINDOWED");
+            allow_windowed = (e && atoi(e) != 0) ? 1 : 0;
+        }
+        if (!allow_windowed) {
+            LOG_INFO("CreateSwapchainKHR: window is not fullscreen on its target display; "
+                     "falling through to native WSI (tearing) -- FLIP4 only engages for "
+                     "fullscreen windows, see README.md. Set FLIP_TEST_ALLOW_WINDOWED=1 to override.");
+            return fallback_to_native_swapchain(dev, device, ci, surf, pAlloc, pOut);
+        }
     }
 
     /* Clamp image count to our range (MIN_IMAGES=3, see its definition).
@@ -3242,7 +3355,7 @@ layer_CreateSwapchainKHR(VkDevice device,
         break;
     default:
         LOG_WARN("CreateSwapchainKHR: unsupported format %d, falling through to passthrough", ci->imageFormat);
-        return dev->d.CreateSwapchainKHR(device, ci, pAlloc, pOut);
+        return fallback_to_native_swapchain(dev, device, ci, surf, pAlloc, pOut);
     }
 
     Swapchain *sc = calloc(1, sizeof(*sc));
@@ -3289,7 +3402,7 @@ layer_CreateSwapchainKHR(VkDevice device,
     if (!sc->fbcfg || !sc->visinfo) {
         LOG_ERR("pick_fbconfig: no suitable FBConfig for format %d", sc->format);
         free(sc);
-        return dev->d.CreateSwapchainKHR(device, ci, pAlloc, pOut);
+        return fallback_to_native_swapchain(dev, device, ci, surf, pAlloc, pOut);
     }
     LOG_INFO("FBConfig visual: depth=%d (parent depth=%d)", sc->visinfo->depth, parent_depth);
 
@@ -3320,7 +3433,7 @@ layer_CreateSwapchainKHR(VkDevice device,
             if (sc->child_colormap) XFreeColormap(surf->dpy, sc->child_colormap);
             if (sc->visinfo) XFree(sc->visinfo);
             free(sc);
-            return dev->d.CreateSwapchainKHR(device, ci, pAlloc, pOut);
+            return fallback_to_native_swapchain(dev, device, ci, surf, pAlloc, pOut);
         }
         XMapWindow(surf->dpy, sc->child_window);
         XFlush(surf->dpy);
@@ -3333,7 +3446,7 @@ layer_CreateSwapchainKHR(VkDevice device,
         XFreeColormap(surf->dpy, sc->child_colormap);
         if (sc->visinfo) XFree(sc->visinfo);
         free(sc);
-        return dev->d.CreateSwapchainKHR(device, ci, pAlloc, pOut);
+        return fallback_to_native_swapchain(dev, device, ci, surf, pAlloc, pOut);
     }
     sc->glctx_owned = true;
 
@@ -3344,7 +3457,7 @@ layer_CreateSwapchainKHR(VkDevice device,
         XFreeColormap(surf->dpy, sc->child_colormap);
         if (sc->visinfo) XFree(sc->visinfo);
         free(sc);
-        return dev->d.CreateSwapchainKHR(device, ci, pAlloc, pOut);
+        return fallback_to_native_swapchain(dev, device, ci, surf, pAlloc, pOut);
     }
 
     if (!resolve_gl_funcs(sc)) goto fail_gl_setup;
@@ -3367,14 +3480,16 @@ layer_CreateSwapchainKHR(VkDevice device,
      * made runtime-detected 2026-08-16 after discovering the hardcoding
      * meant this file could only ever touch DC1, regardless of which
      * monitor the app's window was actually on. Default: auto-detect via
-     * XRandR (detect_dc_for_window) which physical output the window is
-     * on, mapped through a small hardware-specific table (this SoC's
-     * fixed DSI-0->DC0 / DP-0->DC1 wiring). FLIP_TEST_DC, if set,
-     * overrides detection entirely (useful for forcing a specific DC
-     * while testing). Falls back to 1 (the historical default) if
-     * detection fails for any reason. Window ownership has only been
-     * verified on DC1 -- do not assume window 1 is free on a different
-     * DC without checking first (see README). */
+     * XRandR (detect_dc_for_window, already called above for the
+     * FULLSCREEN GATE -- reuse flip_detected_dc rather than detecting
+     * again) which physical output the window is on, mapped through a
+     * small hardware-specific table (this SoC's fixed DSI-0->DC0 /
+     * DP-0->DC1 wiring). FLIP_TEST_DC, if set, overrides detection
+     * entirely (useful for forcing a specific DC while testing). Falls
+     * back to 1 (the historical default) if detection fails for any
+     * reason. Window ownership has only been verified on DC1 -- do not
+     * assume window 1 is free on a different DC without checking first
+     * (see README). */
     int flip_dc_num;
     {
         const char *e = getenv("FLIP_TEST_DC");
@@ -3382,7 +3497,7 @@ layer_CreateSwapchainKHR(VkDevice device,
             flip_dc_num = atoi(e);
             LOG_INFO("FLIP_TEST: DC%d forced via FLIP_TEST_DC", flip_dc_num);
         } else {
-            flip_dc_num = detect_dc_for_window(surf->dpy, surf->window);
+            flip_dc_num = flip_detected_dc;
             if (flip_dc_num < 0) {
                 LOG_WARN("FLIP_TEST: DC auto-detection failed, falling back to DC1");
                 flip_dc_num = 1;
@@ -3640,7 +3755,7 @@ fail_gl_setup:
     if (sc->visinfo) XFree(sc->visinfo);
     free(sc);
     /* Soft fail: fall through to the real Vulkan WSI so the app still runs (with tearing). */
-    return dev->d.CreateSwapchainKHR(device, ci, pAlloc, pOut);
+    return fallback_to_native_swapchain(dev, device, ci, surf, pAlloc, pOut);
 }
 
 VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL

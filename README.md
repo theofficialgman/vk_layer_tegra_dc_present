@@ -1021,3 +1021,127 @@ within the first ~300 frames at best. `FLIP_TEST_FORCE_FIFO` and
 default off) since they were directly responsible for isolating and then
 pinpointing this bug and will likely be useful again for anything
 MAILBOX-shaped in the future.
+
+## Update 2026-08-17 part 4: windowed apps only make visual sense fullscreen -- gated it
+
+Testing so far always used fullscreen apps (gears, vkgears, dolphin,
+the Play emulator once it reaches gameplay). Testing a genuinely windowed
+app exposed a real correctness gap: `TEGRA_DC_EXT_FLIP4` presents via a
+raw hardware overlay plane (window index, not to be confused with an X11
+window -- a DC hardware concept, see the FLIP_TEST banner comment near the
+top of `flip_layer.c`), which the display hardware composites on top of
+whatever Xorg's own desktop plane is showing, *unconditionally*, with no
+awareness of X11 window stacking. For a windowed app this breaks two
+things at once:
+
+- **Position**: `win.out_x`/`win.out_y` are relative to the *target
+  display's own origin*, not the X11 root window's -- they were hardcoded
+  to `0,0`, so a windowed app's content always appeared pinned to the
+  physical display's top-left corner instead of wherever its actual window
+  was on screen.
+- **Occlusion**: the overlay plane always draws on top, full stop -- drag
+  another window over a windowed app running under this layer and the
+  overlay content would still show through on top of it, since the DC
+  hardware has no concept of X11 window stacking to respect.
+
+The position bug is trivially fixable (store the window's on-screen
+position, feed it into `out_x`/`out_y`). Occlusion is not, not without
+routing the final content through Xorg's own compositing pipeline the way
+every other window's content does -- and that's the exact mechanism this
+whole layer exists to route *around*, since native Vulkan WSI already does
+that and tears (see the top of this file). There's no way to get FLIP4's
+tear-free hardware-plane presentation *and* have Xorg's compositor
+correctly clip it around other windows; those are two different
+presentation mechanisms.
+
+**Decision: gate FLIP4 on the window being fullscreen.** Only engage the
+FLIP4 present path when the window's size and position exactly match its
+target display's CRTC rect, computed in `detect_dc_for_window` (which
+already had the XRandR/CRTC-matching machinery needed). Deliberately exact,
+not "close" (e.g. an area-overlap threshold): a maximized-but-still-a-
+regular window can cover nearly the whole display too, especially with
+decoration-less/CSD windows, and must not be treated as fullscreen here --
+unlike true exclusive fullscreen it's still a normal occludable window,
+which a raw hardware overlay plane can't respect. Windowed swapchains fall
+through to native passthrough
+WSI -- tearing, exactly as they would without this layer at all, which is
+a strictly better outcome than tearing *and* being mispositioned *and*
+never being occluded correctly. This isn't just a workaround for
+occlusion: gating on fullscreen also makes the `out_x=out_y=0` hardcoding
+*correct by construction* (a window that covers its display necessarily
+starts at that display's own origin), so no separate position fix was
+even needed once the gate was in place.
+
+This falls out naturally from how every app tested so far already
+behaves: dolphin-emu, vkgears, and the Play emulator all create a small
+windowed swapchain first and *recreate* it fullscreen on their own
+windowed -> fullscreen transition. The first (windowed) `CreateSwapchainKHR`
+now falls through to native WSI automatically; the second (fullscreen) one
+engages FLIP4 exactly as before, with zero extra plumbing needed to detect
+the transition. `FLIP_TEST_ALLOW_WINDOWED=1` overrides the gate for
+testing the FLIP4 path itself against a non-fullscreen window (e.g.
+vkcube's default 500x500, used throughout the width-alignment
+investigation above) -- position will be wrong in that case, which is
+expected and fine for that specific diagnostic purpose.
+
+**A real, independent bug found and fixed while implementing this**: every
+"soft fail, fall through to native WSI" path in `layer_CreateSwapchainKHR`
+except the `dev->passthrough` branch forwarded `ci` to the ICD unmodified
+-- but `ci->surface` may be *this layer's own* fake `Surface*` wrapper
+handle (what `layer_CreateXlibSurfaceKHR`/`layer_CreateXcbSurfaceKHR` hand
+back to the app), not a real native surface object. The ICD dereferencing
+that as if it were real crashes (SIGSEGV) -- confirmed the moment the new
+fullscreen gate turned "fall through" from a rare error path into the
+common case for every windowed app. Fixed with a shared
+`fallback_to_native_swapchain()` helper (mirroring what the
+`dev->passthrough` branch already did correctly) that swaps in
+`surf->icd_surface` before forwarding, used at all nine fallback sites in
+the function. Confirmed fixed: a windowed `vkcube` now runs and renders
+normally in its own window (native WSI, tearing, same as without the
+layer) instead of crashing; a fullscreen `vkgears -fullscreen` still
+engages FLIP4 and remains tear-free, both user-confirmed.
+
+## Update 2026-08-17 part 5: resizing a windowed app crashed -- oldSwapchain double-destroy
+
+Resizing `~/Vulkan/build/bin/gears -vs` (a windowed app, correctly using
+the native-WSI fallback per the FULLSCREEN GATE above) crashed on every
+resize. `layer_CreateSwapchainKHR` has always unconditionally destroyed
+`ci->oldSwapchain` itself at the top of the function, added earlier to fix
+a real bug (an app going windowed -> fullscreen leaving its old FLIP4
+worker thread and hardware window claim orphaned, see the "recreation...
+was never handled" comment above it). That fix's reasoning -- "safe to
+call unconditionally, `layer_DestroySwapchainKHR` already falls through to
+the native destroy for handles that aren't ours" -- covered the *destroy
+call itself* safely, but missed a second consequence: `ci->oldSwapchain`
+is still sitting in `ci`, which (for a windowed app) then gets forwarded
+*unmodified* to a real `CreateSwapchainKHR` call in the native-WSI
+fallback path a few lines later. The real ICD also consumes/retires
+`oldSwapchain` as part of that call -- so the handle got destroyed twice:
+once by us eagerly, once by the driver internally. Per the Vulkan spec,
+`oldSwapchain` is only *retired* by a `CreateSwapchainKHR` call, not
+destroyed -- the application still owns it and is expected to call
+`vkDestroySwapchainKHR` on it separately itself, which is exactly what the
+logs showed `gears -vs` doing on every resize, right into a handle we'd
+already freed.
+
+This bug predates the FULLSCREEN GATE (part 4 above) but was never
+triggered by it: falling through to native WSI used to be a rare error
+path, never exercised by a live app doing real swapchain recreation with
+`oldSwapchain` set. The gate made native-WSI fallback the *normal* path
+for every windowed app, so any windowed app that resizes (recreating its
+swapchain, most do) now hit this on every single resize.
+
+Fixed by only performing the eager destroy when `oldSwapchain` is
+confirmed to be one of this layer's own fake `Swapchain*` structs
+(`as_swapchain(ci->oldSwapchain) != NULL`) -- exclusively our call to make
+in that case, since the real ICD never knew that handle existed. For a
+real native handle, `ci->oldSwapchain` is now left completely untouched
+and flows through unmodified to whatever `CreateSwapchainKHR` call ends up
+handling the request (fallback or passthrough), exactly matching normal
+Vulkan swapchain-recreation semantics. Confirmed fixed: `gears -vs`
+survives repeated manual resizing with no crash (user-confirmed); the
+original motivating scenario (an app transitioning windowed -> fullscreen
+while its old swapchain is one of ours) still works correctly too --
+re-tested with `vkgears -fullscreen`'s own internal 300x300 -> 2560x1600
+swapchain recreation, still engages FLIP4 tear-free on both swapchains
+with no orphaned worker thread.
