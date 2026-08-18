@@ -228,7 +228,8 @@
     M(XResizeWindow,     int,     (Display *, Window, unsigned, unsigned)) \
     M(XFlush,            int,     (Display *)) \
     M(XChangeProperty,   int,     (Display *, Window, Atom, Atom, int, int, const unsigned char *, int)) \
-    M(XTranslateCoordinates, Bool, (Display *, Window, Window, int, int, int *, int *, Window *))
+    M(XTranslateCoordinates, Bool, (Display *, Window, Window, int, int, int *, int *, Window *)) \
+    M(XGetWindowProperty, int,    (Display *, Window, Atom, long, long, Bool, Atom, Atom *, int *, unsigned long *, unsigned long *, unsigned char **))
 
 /* FLIP_TEST: runtime DC auto-detection (detect_dc_for_window). Resolved the
  * same dlopen+dlsym way as X11_FUNCS, for the same reason (avoids the
@@ -384,6 +385,7 @@ static bool lib_load(void) {
 #define XFlush                    (g_libs.XFlush)
 #define XChangeProperty           (g_libs.XChangeProperty)
 #define XTranslateCoordinates     (g_libs.XTranslateCoordinates)
+#define XGetWindowProperty        (g_libs.XGetWindowProperty)
 
 #define XRRGetScreenResourcesCurrent (g_libs.XRRGetScreenResourcesCurrent)
 #define XRRFreeScreenResources       (g_libs.XRRFreeScreenResources)
@@ -2798,6 +2800,45 @@ fail_buf:
     return false;
 }
 
+/* Checks whether the window manager has the EWMH _NET_WM_STATE_FULLSCREEN
+ * atom set on this window -- the semantically correct signal for "this is
+ * genuinely exclusive fullscreen," as opposed to merely maximized (which
+ * sets _NET_WM_STATE_MAXIMIZED_VERT/_HORZ instead, not this atom). Modern
+ * WM-managed apps (SDL, GLFW, Qt, etc.) set this correctly when they
+ * request real fullscreen. Combined with the exact CRTC-size/position
+ * match in detect_dc_for_window below as a second, independent signal --
+ * belt and suspenders against a maximized window that happens to size-
+ * match its display exactly too (some WMs strip decorations on maximize,
+ * making size alone ambiguous). Returns false (conservatively: not
+ * fullscreen) on any query failure, e.g. no _NET_WM_STATE support at all
+ * (no WM running, or an override-redirect window bypassing WM interaction
+ * entirely) -- fails toward the native-WSI fallback rather than risking a
+ * wrong occlusion/position guess. */
+static bool is_wm_fullscreen(Display *dpy, Window win) {
+    Atom state_atom = XInternAtom(dpy, "_NET_WM_STATE", True);
+    Atom fs_atom = XInternAtom(dpy, "_NET_WM_STATE_FULLSCREEN", True);
+    if (state_atom == None || fs_atom == None) return false;
+
+    Atom actual_type;
+    int actual_format;
+    unsigned long nitems, bytes_after;
+    unsigned char *prop = NULL;
+    if (XGetWindowProperty(dpy, win, state_atom, 0, 1024, False, XA_ATOM,
+                            &actual_type, &actual_format, &nitems, &bytes_after,
+                            &prop) != Success || !prop) {
+        return false;
+    }
+    bool found = false;
+    if (actual_type == XA_ATOM && actual_format == 32) {
+        Atom *atoms = (Atom *)prop;
+        for (unsigned long i = 0; i < nitems; i++) {
+            if (atoms[i] == fs_atom) { found = true; break; }
+        }
+    }
+    XFree(prop);
+    return found;
+}
+
 /* Figure out which /dev/tegra_dc_N drives the monitor `win` is actually on,
  * via XRandR -- portable and driver-agnostic right up to the last step,
  * which needs a hardware-specific output-name -> DC-number mapping (no
@@ -2808,13 +2849,17 @@ fail_buf:
  * at runtime -- re-verify (add a case here) if this ever runs on
  * different hardware. Returns -1 (caller uses its own default) if
  * detection fails at any step, including an unrecognized output name. */
-/* out_is_fullscreen, if non-NULL, is set to whether the window's size
- * exactly matches its best-matching CRTC's resolution (not just "close",
- * e.g. 98% area overlap -- a maximized-but-still-a-regular-window can
+/* out_is_fullscreen, if non-NULL, is set to whether BOTH: (1) the window's
+ * size exactly matches its best-matching CRTC's resolution (not just
+ * "close", e.g. 98% area overlap), AND (2) the window manager has the
+ * EWMH _NET_WM_STATE_FULLSCREEN atom set (see is_wm_fullscreen above).
+ * Size alone isn't enough -- a maximized-but-still-a-regular-window can
  * cover nearly the whole display too, especially decoration-less/CSD
  * windows, and must NOT be treated as fullscreen here: unlike true
  * exclusive fullscreen it's still occludable by other windows, which a
- * raw hardware overlay plane can't respect). See the FULLSCREEN GATE
+ * raw hardware overlay plane can't respect. Requiring the WM's own
+ * fullscreen flag too is the second, independent signal that actually
+ * distinguishes the two cases. See the FULLSCREEN GATE
  * comment in layer_CreateSwapchainKHR for why this matters: it's not just
  * an occlusion nicety, TEGRA_DC_EXT_FLIP4's out_x/out_y are relative to
  * the target display's own origin, not the X11 root window's, so exactly
@@ -2864,9 +2909,10 @@ static int detect_dc_for_window(Display *dpy, Window win, bool *out_is_fullscree
     if (best_crtc != None) {
         XRRCrtcInfo *ci = XRRGetCrtcInfo(dpy, res, best_crtc);
         if (ci && out_is_fullscreen) {
-            *out_is_fullscreen = ci->width > 0 && ci->height > 0 &&
+            bool size_match = ci->width > 0 && ci->height > 0 &&
                 ww == ci->width && wh == ci->height &&
                 abs_x == ci->x && abs_y == ci->y;
+            *out_is_fullscreen = size_match && is_wm_fullscreen(dpy, win);
         }
         if (ci && ci->noutput > 0) {
             XRROutputInfo *oi = XRRGetOutputInfo(dpy, res, ci->outputs[0]);
@@ -3343,6 +3389,7 @@ layer_CreateSwapchainKHR(VkDevice device,
      * on demand, without a source edit, against whichever app you want to
      * point it at. */
     uint32_t want = ci->minImageCount;
+    LOG_INFO("CreateSwapchainKHR: app requested minImageCount=%u", ci->minImageCount);
     {
         static long force_count = -2;   /* -2 = not yet read, -1 = confirmed unset */
         if (force_count == -2) {

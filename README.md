@@ -1136,15 +1136,26 @@ correctly clip it around other windows; those are two different
 presentation mechanisms.
 
 **Decision: gate FLIP4 on the window being fullscreen.** Only engage the
-FLIP4 present path when the window's size and position exactly match its
-target display's CRTC rect, computed in `detect_dc_for_window` (which
-already had the XRandR/CRTC-matching machinery needed). Deliberately exact,
-not "close" (e.g. an area-overlap threshold): a maximized-but-still-a-
-regular window can cover nearly the whole display too, especially with
-decoration-less/CSD windows, and must not be treated as fullscreen here --
-unlike true exclusive fullscreen it's still a normal occludable window,
-which a raw hardware overlay plane can't respect. Windowed swapchains fall
-through to native passthrough
+FLIP4 present path when BOTH: (1) the window's size and position exactly
+match its target display's CRTC rect, and (2) the window manager has the
+EWMH `_NET_WM_STATE_FULLSCREEN` atom set on the window (`is_wm_fullscreen`,
+alongside the XRandR/CRTC-matching machinery in `detect_dc_for_window`).
+Size match alone isn't sufficient, and an area-overlap threshold (e.g.
+98%) is worse still: a maximized-but-still-a-regular window can cover
+nearly the whole display too, and on some WM/panel configurations can
+match a display's resolution exactly (decoration-less/CSD windows, no
+panel reserving space, etc.) -- maximized must NOT be treated as
+fullscreen here, since unlike true exclusive fullscreen it's still a
+normal occludable window, which a raw hardware overlay plane can't
+respect. `_NET_WM_STATE_FULLSCREEN` (as opposed to
+`_NET_WM_STATE_MAXIMIZED_VERT`/`_HORZ`, which is what maximizing actually
+sets) is the semantically correct, WM-independent signal that actually
+distinguishes the two -- confirmed 2026-08-17 by maximizing `vkcube` via
+`wmctrl` mid-run: its window resized to 2560x1572 (not an exact CRTC
+match on this desktop's panel layout, but `_NET_WM_STATE` correctly showed
+`MAXIMIZED_VERT`/`MAXIMIZED_HORZ` with no `FULLSCREEN` atom either way),
+and the layer correctly fell through to native WSI rather than treating
+it as fullscreen. Windowed swapchains fall through to native passthrough
 WSI -- tearing, exactly as they would without this layer at all, which is
 a strictly better outcome than tearing *and* being mispositioned *and*
 never being occluded correctly. This isn't just a workaround for
