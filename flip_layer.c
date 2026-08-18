@@ -24,55 +24,65 @@
  * vk_layer_tegra_x11_present.c
  *
  * Vulkan implicit layer for NVIDIA Tegra L4T r32.x that fixes the broken
- * Vulkan-on-X11 present path by routing presentation through GL/GLX
- * instead of Vulkan WSI.
+ * Vulkan-on-X11 present path by presenting directly through the display
+ * controller's TEGRA_DC_EXT_FLIP4 ioctl instead of Vulkan WSI.
  *
  * BACKGROUND
  *
  * On Tegra L4T r32.x the Nvidia Vulkan ICD's WSI implementation for X11
  * does not produce vsync-locked presentation. Frames tear. This is a known
  * driver-side issue with no available fix from Nvidia (the BSP is EOL'd).
+ * NVIDIA's own GL driver does NOT have this problem -- its uncomposited GL
+ * swap path is genuinely tear-free (confirmed via kernel-side ioctl
+ * tracing; see README.md) through some other, closed-source mechanism that
+ * never touches FLIP4 at all. This is a Vulkan-WSI-specific bug, not a
+ * platform-wide limitation.
  *
- * However, the same driver does support:
- *   - Vulkan external memory export via VK_KHR_external_memory_fd
- *     (OPAQUE_FD handle type, OPTIMAL tiling, BGRA8/RGBA8 UNORM/SRGB)
- *   - Vulkan external semaphore export via VK_KHR_external_semaphore_fd
- *     (OPAQUE_FD handle type)
- *   - GL import of both via GL_EXT_memory_object_fd and GL_EXT_semaphore_fd
- *   - Working vsync-locked GL presentation through GLX_SGI_video_sync.
+ * This layer replaces the WSI surface and swapchain with its own
+ * implementation that presents by calling TEGRA_DC_EXT_FLIP4 directly on
+ * the display controller device node (/dev/tegra_dc_N), the same kernel
+ * ioctl NVIDIA's own drivers use under the hood. The application's Vulkan
+ * rendering is untouched:
  *
- * This layer plumbs the two together. The application's Vulkan rendering is
- * untouched; we replace the WSI surface and swapchain with our own
- * implementation that:
- *
- *   1. Allocates the swapchain images as OPAQUE_FD-exportable Vulkan images
- *      (the application renders into them as if they were normal swapchain
- *      images).
- *   2. Imports each image into our GL/GLX context as a GL texture.
- *   3. At vkQueuePresentKHR time: bridges the application's render-done
- *      semaphore into a GL semaphore and posts the image to our worker.
- *   4. Bridges GL's sample-done back into a Vulkan semaphore so that the
- *      next vkAcquireNextImageKHR correctly gates the application's
+ *   1. Allocates the swapchain images as ordinary OPTIMAL-tiled Vulkan
+ *      images the application renders into exactly as it would real
+ *      swapchain images.
+ *   2. At vkQueuePresentKHR time: bridges the application's render-done
+ *      semaphore, hands the image index to a worker thread via a
+ *      single-slot mailbox, and returns.
+ *   3. The worker (GPU-side, no CPU readback) either vkCmdCopyImage's the
+ *      rendered content into a separate LINEAR-tiled exportable image, or
+ *      -- for tear-free output, see FLIP_TEST_GOB_REAL below -- dispatches
+ *      a compute shader that converts it into the display controller's
+ *      real block-linear (GOB) tiling layout in a raw exported buffer, then
+ *      calls TEGRA_DC_EXT_FLIP4 with that buffer's dma-buf fd as buff_id.
+ *   4. Bridges the worker's own completion back into a Vulkan semaphore so
+ *      the next vkAcquireNextImageKHR correctly gates the application's
  *      re-use of the image.
  *
- * No EGL, no dmabuf, no DRM. Only Nvidia's own Vulkan↔GL interop primitives.
+ * Entirely pure Vulkan in the data path -- no GL rendering, no GL texture
+ * import, no cross-API interop of any kind. See the FLIP_TEST banner
+ * comment below for the one remaining GL/GLX dependency (vsync pacing
+ * only) and README.md for the full investigation and tearing-fix result.
  *
  * ARCHITECTURE
  *
- * One worker thread per swapchain owns the GLX context for the lifetime of
- * the swapchain. The application's render thread calls Acquire/Present;
- * Present hands work to the worker via a single-slot mailbox and returns
- * immediately. The worker samples the image into the GLX backbuffer, calls
- * glXSwapBuffers (with swap interval 0), then blocks on the actual hardware
- * vblank via glXWaitVideoSyncSGI. This pattern lets the worker thread sleep
- * in the kernel during vsync, rather than spinning in libGLX_nvidia's
- * sched_yield-based default wait. The technique is the same one KWin uses
+ * One worker thread per swapchain. The application's render thread calls
+ * Acquire/Present; Present hands work to the worker via a single-slot
+ * mailbox and returns immediately. The worker does the GPU-side content
+ * conversion described above, issues the FLIP4 ioctl, then blocks on the
+ * actual hardware vblank via glXWaitVideoSyncSGI (FLIP4 itself does not
+ * block for vblank, and pacing the worker to real display refresh is what
+ * keeps frame delivery smooth) before processing the next pending frame.
+ * This lets the worker thread sleep in the kernel during vsync, rather
+ * than spinning in a busy wait. The technique is the same one KWin uses
  * for NVIDIA on X11 (see plugins/platforms/x11/standalone/glxbackend.cpp,
- * SGIVideoSyncVsyncMonitor).
+ * SGIVideoSyncVsyncMonitor) -- adapted here to pace FLIP4 rather than
+ * glXSwapBuffers, which this layer never calls.
  *
  * vkAcquireNextImageKHR CPU-blocks the application on a per-image fence
- * that the worker signals via the GL→Vulkan semaphore bridge; this is what
- * paces the app's render loop to real presentation rate.
+ * that the worker signals once its bridge submit for that image completes;
+ * this is what paces the app's render loop to real presentation rate.
  *
  * RUNTIME LIBRARY LOADING
  *
@@ -1002,15 +1012,17 @@ typedef struct Swapchain {
     /* Per-swapchain command pool for our bridge submits. */
     VkCommandPool  cpool;
 
-    /* Async GL worker.
+    /* Async present worker.
 
        Architecture: a dedicated thread owns the GLX context — made current
        once at thread start, never un-made until shutdown. This avoids the
        per-present cost of glXMakeCurrent and decouples the app's render
-       thread from glXSwapBuffers's vsync wait. On Nvidia, glXSwapBuffers
-       with swap interval >= 1 spin-waits on the CPU side until vblank;
-       running it on a dedicated thread means it doesn't burn the app's
-       core. The app thread submits a job and returns immediately.
+       thread from the worker's own presentation pacing: the content
+       conversion (vkCmdCopyImage detile or the GOB compute shader), the
+       FLIP4 ioctl, and the glXWaitVideoSyncSGI vblank wait that paces
+       frame delivery (see the FLIP_TEST banner comment near the top of
+       this file) all happen on this thread, not the app's. The app thread
+       submits a job and returns immediately.
 
        Pending slot: a single image-index awaiting present, plus a flag.
        This single-slot design is the backpressure mechanism — if the
@@ -1187,25 +1199,27 @@ layer_DestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain,
 /* GLX helpers                                                             */
 /* ----------------------------------------------------------------------- */
 
-/* Choose an FBConfig matching the requested swapchain format. We always
-   double-buffer; depth is irrelevant since GL renders only a textured quad.
-   We need an FBConfig whose visual matches the X window's visual, but
-   that's a problem the app already solved at window creation time — the
-   window has SOME visual, and we ask GLX to find a doublebuffered RGBA
-   FBConfig of equivalent depth. */
-/* Pick a doublebuffered RGBA GLX framebuffer config. We prefer one whose
-   X visual depth is 32 — that's the ARGB visual that compositors will
-   alpha-blend with the desktop. With a 24-bit visual the X server treats
-   the window as opaque regardless of how much alpha we render into it,
-   which manifests as black borders around apps that use CSD shadows
-   (Chromium, GTK3/4 client-side-decorated apps, Electron, etc.). If a
-   32-bit visual isn't available we accept any RGBA FBConfig and let the
-   compositor render the window opaquely.
+/* Choose an FBConfig matching the requested swapchain format, purely so
+   glXCreateNewContext/glXMakeCurrent have a valid, matching visual to work
+   with -- GLX requires the drawable's visual to match the context's
+   FBConfig or glXMakeCurrent returns BadMatch. Nothing is ever rendered
+   through this context or this visual (see the FLIP_TEST banner comment
+   near the top of this file): the actual displayed content comes from
+   TEGRA_DC_EXT_FLIP4 driving a display-controller hardware plane directly,
+   bypassing this window's normal X/compositor rendering entirely. The
+   alpha/SRGB/depth preferences below (32-bit ARGB to avoid compositor
+   black-border artifacts, etc.) were meaningful back when this layer
+   actually rendered a GL-textured quad into this drawable for the
+   compositor to blend -- now they most likely have zero effect on what the
+   user sees, since there's no GL content in this drawable for a compositor
+   to blend in the first place. Left in place as a harmless, still-correct
+   choice rather than stripped down to "pick anything valid", since nobody
+   has verified they're actually inert on every compositor -- worth
+   revisiting if this file's remaining GL dependency is ever removed
+   entirely.
 
    parent_depth, if nonzero, is a preference toward matching the X parent
-   window's visual depth — if the app's window is depth 24 there's no
-   compositor blending to preserve and the simpler/faster 24-bit visual
-   is fine. */
+   window's visual depth. */
 static GLXFBConfig pick_fbconfig(Display *dpy, int screen, VkFormat fmt,
                                  int parent_depth, XVisualInfo **out_vi) {
     int red=8, green=8, blue=8, alpha=8;
@@ -1239,9 +1253,9 @@ static GLXFBConfig pick_fbconfig(Display *dpy, int screen, VkFormat fmt,
     if (!fbs || nfb == 0) return NULL;
 
     /* Search returned FBConfigs for one whose visual matches the parent
-       window's depth (if specified) or is depth 32 (preferred for
-       compositor alpha blending). Fall back to the first FBConfig if no
-       match. */
+       window's depth (if specified) or is depth 32 (see this function's
+       top comment for why 32 is preferred, and why it likely no longer
+       matters). Fall back to the first FBConfig if no match. */
     GLXFBConfig pick = fbs[0];
     XVisualInfo *pick_vi = glXGetVisualFromFBConfig(dpy, pick);
     int want_depth = (parent_depth == 32 || parent_depth == 24) ? parent_depth : 32;
@@ -1257,8 +1271,8 @@ static GLXFBConfig pick_fbconfig(Display *dpy, int screen, VkFormat fmt,
         XFree(vi);
     }
     /* If nothing matched our preferred depth, fall back to ANY 32-bit
-       visual — the compositor case is more important than matching the
-       parent's depth exactly. */
+       visual over matching the parent's depth exactly -- see this
+       function's top comment. */
     if (pick_vi && pick_vi->depth != want_depth && want_depth != 32) {
         for (int i = 0; i < nfb; i++) {
             XVisualInfo *vi = glXGetVisualFromFBConfig(dpy, fbs[i]);
@@ -4274,8 +4288,11 @@ layer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pInfo) {
             continue;
         }
 
-        /* The GL side runs in the worker thread which owns the GLX context.
-           In FIFO mode this call blocks if the worker is still busy with
+        /* The actual present work (content conversion + FLIP4) runs on the
+           worker thread, which also owns the GLX context used purely for
+           vsync pacing (see the FLIP_TEST banner comment near the top of
+           this file). In FIFO mode this call blocks if the worker is still
+           busy with
            the previous image — that's the natural backpressure point.
            In MAILBOX mode this call returns immediately and reports back
            the index of any image whose place we just took, so we can
