@@ -109,12 +109,15 @@ to leave unset for normal use.
   Kept for reference; not recommended over the default.
 - `FLIP_TEST_DELAY_US=<us>` -- extra sleep inserted right before `FLIP4`,
   after the SGI wait. Used for a manual vblank-phase timing sweep.
-- `FLIP_TEST_WAIT_AFTER_FLIP=1` -- moves the SGI vblank wait to *after*
-  `FLIP4` instead of before (the default). Originally found to cause a
-  consistent mid-frame tear; re-tested 2026-08-18 and stayed tear-free
-  against two apps on the driver in use at the time (see "Update
-  2026-08-18") -- possibly driver-version-dependent. Not the default;
-  needs a longer soak test before trusting it over the current ordering.
+- `FLIP_TEST_WAIT_AFTER_FLIP=0` -- moves the SGI vblank wait back to
+  *before* `FLIP4` (the pre-2026-08-18 default), giving the deferred
+  kernel worker a guaranteed-maximal, but higher-latency, margin before
+  the next vblank. The default (unset, or explicitly `=1`) waits *after*
+  `FLIP4` instead, calling it the instant content is ready for up to
+  ~1 vblank interval (~16ms) less latency -- this exact ordering
+  previously caused a consistent mid-frame tear on an earlier driver (see
+  "Update 2026-08-18"), so revert to `=0` if tearing appears on a
+  different driver, heavier scene, or under system load.
 
 **Debugging**
 - `FLIP_TEST_TRACE_SYNC=1` -- logs a global sequence-numbered trace of
@@ -1254,8 +1257,8 @@ consistent mid-frame tear -- calling `FLIP4` at an arbitrary phase
 after a known vblank edge gave the driver less lead time to latch the new
 buffer before the *next* vblank.
 
-Re-tested 2026-08-18 with a new opt-in toggle, `FLIP_TEST_WAIT_AFTER_FLIP=1`
-(moves the wait back to after `FLIP4`, the original ordering), against both
+Re-tested 2026-08-18 with a new toggle, `FLIP_TEST_WAIT_AFTER_FLIP` (moves
+the wait back to after `FLIP4`, the original ordering), against both
 `vkgears -fullscreen` and `~/Vulkan/build/bin/gears -f -vs`: **both stayed
 tear-free** in this session's testing, contradicting the earlier result.
 The most likely explanation is the NVIDIA driver was changed at some point
@@ -1264,13 +1267,18 @@ original mid-frame-tear finding may be specific to whichever driver
 version was in use when it was established, not a universal property of
 this hardware/ioctl combination.
 
-**Not changed as the default** -- kept as an opt-in diagnostic toggle
-rather than flipping the default, since this session's re-test was
-relatively short (tens of seconds per app) and several other bugs in this
-investigation (the MAILBOX displacement race, in particular) only
-surfaced after much longer runs or specific timing conditions that a short
-test can miss. If this ordering does turn out to reduce latency
-meaningfully without reintroducing tearing under extended/varied testing,
-revisit making it the default -- but that needs a longer soak test first,
-ideally across more than one app and more than a few minutes, before
-trusting it over the currently-default, more conservative ordering.
+**Made the default.** After-FLIP4 is a real, mechanistic latency
+improvement, not just a coin flip: it removes up to ~1 vblank interval
+(~16ms) of "content ready but waiting to even call FLIP4" delay, at the
+cost of a smaller, timing-dependent margin for the deferred kernel worker
+to finish before the next vblank (versus the old ordering's guaranteed-
+maximal margin) -- which is mechanistically *why* it tore before. Flipped
+the default 2026-08-18 per direct request, with `FLIP_TEST_WAIT_AFTER_FLIP=0`
+kept available to revert to the more conservative before-FLIP4 ordering
+if tearing reappears under a different driver, heavier scene, or system
+load than this session's relatively short (tens of seconds per app)
+re-test happened to cover -- other bugs in this investigation (the
+MAILBOX displacement race, in particular) only surfaced after much longer
+runs or specific timing conditions a short test can miss, so this default
+is a deliberate, informed bet rather than an exhaustively-soaked
+guarantee.

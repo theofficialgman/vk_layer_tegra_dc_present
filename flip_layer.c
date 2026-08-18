@@ -1621,23 +1621,36 @@ static void *worker_thread_main(void *arg) {
             __u32 kernel_wait_syncpt_val = 0;
             bool  kernel_wait_ok = false;
 
-            /* FLIP_TEST_WAIT_AFTER_FLIP=1: re-test moving the SGI vblank
-               wait to AFTER FLIP4 (see the "Wait for vblank HERE, right
-               before FLIP4" comment below for why it currently isn't) --
-               in case anything relevant has changed since that ordering
-               was established (GOB_REAL landing, driver updates, etc.).
-               Default (0) keeps the wait before FLIP4. Declared here,
-               above the kernel_pace/GLX-wait branch below, so both the
-               skip-if-set check inside that branch and the do-it-here
-               check after the FLIP4 call further down can see it. */
+            /* Wait for vblank AFTER FLIP4, not before -- default as of
+               2026-08-18. FLIP4 is called the instant content is ready
+               instead of being gated behind a full extra vblank wait
+               first, giving up to ~1 vblank interval (~16ms) less
+               "content ready to visible" latency (see the "Wait for
+               vblank HERE, right before FLIP4" comment in the branch
+               below, still present and selected by
+               FLIP_TEST_WAIT_AFTER_FLIP=0, for the mechanism and history:
+               this exact ordering previously caused a consistent
+               mid-frame tear on an earlier driver, and was moved before
+               FLIP4 to fix it). Re-tested 2026-08-18 against vkgears
+               -fullscreen and gears -f -vs, both tear-free -- the driver
+               was changed since the original finding, so this is
+               plausibly driver-version-dependent rather than a universal
+               property of the hardware/ioctl combination. Set
+               FLIP_TEST_WAIT_AFTER_FLIP=0 to revert to the more
+               conservative before-FLIP4 ordering if tearing reappears
+               (different driver, heavier scene, system load, etc. could
+               all shrink the deferred kernel worker's margin before the
+               next vblank). Declared here, above the kernel_pace/GLX-wait
+               branch below, so both the skip-if-set check inside that
+               branch and the do-it-here check after the FLIP4 call
+               further down can see it. */
             static int wait_after_flip = -1;
             if (wait_after_flip < 0) {
                 const char *e = getenv("FLIP_TEST_WAIT_AFTER_FLIP");
-                wait_after_flip = (e && atoi(e) != 0) ? 1 : 0;
-                if (wait_after_flip)
-                    LOG_WARN("FLIP_TEST_WAIT_AFTER_FLIP=1: moving the SGI vblank "
-                             "wait to AFTER FLIP4 -- previously found to produce a "
-                             "consistent mid-frame tear, re-testing on purpose");
+                wait_after_flip = e ? (atoi(e) != 0 ? 1 : 0) : 1;
+                LOG_INFO("FLIP_TEST: SGI vblank wait ordering: %s",
+                         wait_after_flip ? "after FLIP4 (default, lower latency)"
+                                          : "before FLIP4 (FLIP_TEST_WAIT_AFTER_FLIP=0, more conservative)");
             }
 
             if (sc->flip_kernel_pace) {
@@ -1681,15 +1694,22 @@ static void *worker_thread_main(void *arg) {
                  * stays false) -- gating the latch again would just add
                  * another vblank of pure delay on top for no purpose. */
             } else {
-                /* Wait for vblank HERE, right before FLIP4, instead of
-                 * after -- gives the driver maximum lead time before the
-                 * *next* vblank to latch the new buffer, instead of
-                 * calling FLIP4 at an arbitrary phase (whenever the copy
-                 * above happened to finish) and only pacing the *next*
-                 * loop iteration. The previous ordering produced a tear
-                 * consistently mid-frame instead of at the top -- exactly
-                 * the signature of flipping at a fixed but not-vblank-
-                 * aligned offset into each frame interval.
+                /* FLIP_TEST_WAIT_AFTER_FLIP=0 (opt-out from the 2026-08-18
+                 * default -- see the wait_after_flip comment above): wait
+                 * for vblank HERE, right before FLIP4, instead of after.
+                 * Gives the driver maximum lead time before the *next*
+                 * vblank to latch the new buffer, instead of calling
+                 * FLIP4 at an arbitrary phase (whenever the copy above
+                 * happened to finish) and only pacing the *next* loop
+                 * iteration. This ordering was the default until
+                 * 2026-08-18: an earlier driver produced a tear
+                 * consistently mid-frame instead of at the top with the
+                 * after-FLIP4 ordering -- exactly the signature of
+                 * flipping at a fixed but not-vblank-aligned offset into
+                 * each frame interval -- which is why this wait moved
+                 * here in the first place. Re-test with
+                 * FLIP_TEST_WAIT_AFTER_FLIP=0 if the current default
+                 * starts tearing on some driver/scene/load combination.
                  *
                  * FLIP_TEST Option 1 (flip_kernel_wait) does NOT remove
                  * this wait -- source-verified (dev.c: tegra_dc_ext_flip())
@@ -1884,9 +1904,12 @@ static void *worker_thread_main(void *arg) {
             if (_f4_ret < 0)
                 LOG_WARN("FLIP_TEST: FLIP4 failed: %m");
 
-            /* FLIP_TEST_WAIT_AFTER_FLIP=1 counterpart to the skip above --
-               see that comment and the "Wait for vblank HERE, right before
-               FLIP4" comment further up for the reasoning being re-tested. */
+            /* Default (FLIP_TEST_WAIT_AFTER_FLIP unset or 1) SGI vblank
+               wait -- see the wait_after_flip comment above for why this
+               is the default as of 2026-08-18 and the "Wait for vblank
+               HERE, right before FLIP4" comment further up (the
+               FLIP_TEST_WAIT_AFTER_FLIP=0 path) for the more conservative
+               alternative ordering. */
             if (wait_after_flip &&
                 sc->glXWaitVideoSyncSGI && sc->present_mode != VK_PRESENT_MODE_IMMEDIATE_KHR) {
                 unsigned int count = 0;
