@@ -115,6 +115,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <time.h>
+#include <sys/syscall.h>
 
 #define VK_USE_PLATFORM_XLIB_KHR 1
 #define VK_USE_PLATFORM_XCB_KHR  1
@@ -436,6 +437,23 @@ static FILE *g_log_fp = NULL;
    and is only meant for one-shot fault localization. */
 static bool g_diag_wait_after_submit = false;
 
+/* FLIP_TEST_TRACE_SYNC=1: log every touch of the per-image vk_render_done /
+   gl_sample_done binary semaphores and worker_pending state, with a global
+   sequence number and the calling thread's TID, so a multi-threaded app's
+   actual interleaving can be reconstructed after a hang instead of guessed
+   at from code reading. Added 2026-08-17 chasing a Play-emulator GPU hang
+   in the MAILBOX displaced-image bookkeeping that survived two real fixes
+   to the more obvious races -- suspected to be a third, thread-interleaving-
+   dependent gap only a real trace can pin down. */
+static bool g_trace_sync = false;
+static uint64_t g_trace_seq = 0;
+#define TRACE_SYNC(fmt, ...) do { \
+    if (g_trace_sync) { \
+        uint64_t _ts = __atomic_add_fetch(&g_trace_seq, 1, __ATOMIC_SEQ_CST); \
+        LOG_INFO("SYNCTRACE#%" PRIu64 " tid=%d " fmt, _ts, (int)syscall(SYS_gettid), ##__VA_ARGS__); \
+    } \
+} while (0)
+
 static void layer_log_init(void) {
     /* X11 threading initialization is deferred until lib_load() runs at
        CreateSwapchain time. We don't link libX11 directly anymore (see the
@@ -448,6 +466,11 @@ static void layer_log_init(void) {
     if (diag && atoi(diag) == 1) {
         g_diag_wait_after_submit = true;
         fprintf(stderr, "[" LAYER_NAME "] DIAG MODE: DeviceWaitIdle after every submit (SLOW)\n");
+    }
+    const char *trace = getenv("FLIP_TEST_TRACE_SYNC");
+    if (trace && atoi(trace) == 1) {
+        g_trace_sync = true;
+        fprintf(stderr, "[" LAYER_NAME "] TRACE MODE: logging every semaphore touch (VERY VERBOSE)\n");
     }
     const char *path = getenv("VK_TEGRA_X11_PRESENT_LOG_FILE");
     if (path) {
@@ -1002,6 +1025,23 @@ typedef struct Swapchain {
     pthread_cond_t   worker_cv_done;      /* app waits on this when posting to full slot */
     bool             worker_pending;      /* slot has work? */
     uint32_t         worker_pending_idx;  /* image index in pending slot */
+    /* True from the moment worker_post() fills the pending slot until the
+       worker's OWN per-frame submit (wait vk_render_done / signal
+       gl_sample_done) for worker_pending_idx has completed. worker_pending
+       itself stays true for the WHOLE frame (through the FLIP4 ioctl and
+       vsync wait, well after the semaphores are drained) -- MAILBOX
+       displacement must not key off worker_pending directly, or a
+       worker_post() that lands after the worker has already consumed
+       worker_pending_idx's semaphores (but hasn't finished the rest of the
+       frame yet) "displaces" an image whose vk_render_done/gl_sample_done
+       were already fully waited/signalled by the worker itself, and the
+       resulting drop-cleanup double-signals gl_sample_done -- undefined
+       behaviour, observed hanging the GPU (nvgpu channel-timeout watchdog).
+       Found 2026-08-17 via FLIP_TEST_TRACE_SYNC on the Play emulator: two
+       earlier fixes to the acquire-side and lock-scope races only pushed
+       the failure point later (8->12->9 frames) because this was the real,
+       third gap. */
+    bool             worker_pending_sem_live;
     /* VK_GOOGLE_display_timing: presentID and desiredPresentTime supplied
        by the app for the pending work (zero if not set). The worker
        captures actualPresentTime when the SGI vblank wait returns and
@@ -1314,7 +1354,30 @@ static void *worker_thread_main(void *arg) {
         uint32_t idx = sc->worker_pending_idx;
         uint32_t present_id = sc->worker_pending_present_id;
         uint64_t desired_ns = sc->worker_pending_desired_ns;
+        /* Claim this slot the instant it's dequeued, not later at the
+           worker's own submit call: dequeuing already commits this idx to
+           being processed (its vk_render_done WILL be waited on and
+           gl_sample_done WILL be signaled by this iteration, unconditionally,
+           once it reaches the submit below) -- there is real CPU work
+           between dequeue and that submit (the XGetGeometry/resize check
+           and command buffer recording just below, and for GOB_REAL the
+           compute dispatch barriers). If a new worker_post() lands during
+           that window and still sees worker_pending_sem_live true for this
+           same idx (stale, not yet cleared), it displaces it and queues its
+           OWN wait on vk_render_done -- racing the worker's own soon-to-be-
+           issued wait on the identical, only-signaled-once semaphore.
+           Whichever submit is issued second can never be satisfied and
+           hangs the GPU (nvgpu channel-timeout watchdog). Clearing here,
+           still under worker_lock from the dequeue above (no intervening
+           unlock -- an unlock-then-relock would reopen the exact window
+           this is closing), means by the time any later worker_post() can
+           run, this slot is already correctly "not displaceable". Found
+           2026-08-17 via FLIP_TEST_TRACE_SYNC, Play emulator -- an earlier
+           fix (clearing at submit-issue time) only handled the mirror-image
+           ordering and left this one open. */
+        sc->worker_pending_sem_live = false;
         pthread_mutex_unlock(&sc->worker_lock);
+        TRACE_SYNC("worker dequeued idx=%u", idx);
 
         /* Refresh window size if changed. Cheap when unchanged. Use the
            worker's own Display* for these X calls. */
@@ -1526,11 +1589,17 @@ static void *worker_thread_main(void *arg) {
             si.signalSemaphoreCount = 1;
             si.pSignalSemaphores = &pi->gl_sample_done;
 
+            /* worker_pending_sem_live for this idx was already cleared at
+               dequeue time (see the comment there) -- by this point the
+               slot is long since not displaceable, so nothing further to
+               update here. */
+            TRACE_SYNC("worker idx=%u submit: wait vk_render_done, signal gl_sample_done", idx);
             VkResult sr = queue_submit_locked(sc->dev, sc->dev->graphics_queue, 1, &si, pi->flip_fence);
-            if (sr != VK_SUCCESS) {
-                LOG_WARN("FLIP_TEST: copy QueueSubmit failed: %d", sr);
-            } else {
+            if (sr == VK_SUCCESS) {
                 d->WaitForFences(sc->dev->device, 1, &pi->flip_fence, VK_TRUE, UINT64_MAX);
+                TRACE_SYNC("worker idx=%u flip_fence signaled", idx);
+            } else {
+                LOG_WARN("FLIP_TEST: copy QueueSubmit failed: %d", sr);
             }
 
             __u32 kernel_wait_syncpt_val = 0;
@@ -1911,10 +1980,15 @@ static void worker_post(Swapchain *sc, uint32_t idx,
         /* FIFO path: block until slot is free. */
         while (sc->worker_pending && sc->worker_running)
             pthread_cond_wait(&sc->worker_cv_done, &sc->worker_lock);
-    } else if (sc->worker_pending) {
-        /* MAILBOX path: a previous present hasn't been picked up yet.
-           Replace it; the caller will handle the displaced image's
-           semaphore cleanup. */
+    } else if (sc->worker_pending_sem_live) {
+        /* MAILBOX path: a previous present hasn't had its semaphores
+           consumed by the worker yet. Replace it; the caller will handle
+           the displaced image's semaphore cleanup. If worker_pending is
+           true but worker_pending_sem_live is false, the worker already
+           waited vk_render_done / signalled gl_sample_done for that slot
+           itself (it's just still mid-FLIP4/vsync for the rest of the
+           frame) -- treating that as displaceable here would double-signal
+           gl_sample_done. See worker_pending_sem_live's declaration. */
         displaced = sc->worker_pending_idx;
     }
 
@@ -1925,10 +1999,14 @@ static void worker_post(Swapchain *sc, uint32_t idx,
     }
     sc->worker_pending = true;
     sc->worker_pending_idx = idx;
+    sc->worker_pending_sem_live = true;
     sc->worker_pending_present_id = present_id;
     sc->worker_pending_desired_ns = desired_ns;
     pthread_cond_signal(&sc->worker_cv_pending);
     pthread_mutex_unlock(&sc->worker_lock);
+
+    TRACE_SYNC("worker_post idx=%u displaced=%d mailbox=%d", idx,
+               displaced == UINT32_MAX ? -1 : (int)displaced, (int)is_mailbox);
 
     if (displaced_idx) *displaced_idx = displaced;
 }
@@ -2008,10 +2086,29 @@ static VkResult create_app_image(DevNode *dev, Swapchain *sc, PerImage *pi) {
        because the app renders into it. The OR is intentional — if the app
        already asked for SAMPLED or other flags, we keep them. Strip
        PRESENT_SRC-only flags that don't apply to our offscreen-allocated
-       images. */
+       images.
+
+       SAMPLED_BIT is mandatory, not optional: layer_CreateRenderPass(2)
+       rewrites every attachment's PRESENT_SRC_KHR finalLayout to
+       SHADER_READ_ONLY_OPTIMAL (see fix_layout) so our own worker can
+       consume the app's rendered content afterward, and worker_thread_main
+       assumes that layout unconditionally. Per spec
+       (VUID-vkCmdBeginRenderPass-initialLayout-00897), an attachment with
+       finalLayout SHADER_READ_ONLY_OPTIMAL requires the image to have been
+       created with SAMPLED_BIT (or INPUT_ATTACHMENT_BIT) usage -- without
+       it, using the image that way is undefined behavior. Only STORAGE_BIT
+       was being conditionally added for the GOB_REAL compute-shader path;
+       SAMPLED_BIT itself was never guaranteed unless the app happened to
+       request it. Found via the Khronos validation layer (2026-08-17, Play
+       emulator, which requests plain COLOR_ATTACHMENT_BIT with no SAMPLED)
+       and matches a real VK_ERROR_DEVICE_LOST / nvgpu channel-timeout GPU
+       hang on real hardware -- the Tegra driver's texture unit likely needs
+       state (tiling/compression metadata) that's simply absent on an image
+       never declared samplable. */
     ici.usage = sc->image_usage
               | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
-              | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+              | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+              | VK_IMAGE_USAGE_SAMPLED_BIT;
     if (sc->flip_gob_real) ici.usage |= VK_IMAGE_USAGE_STORAGE_BIT; /* gob_swizzle.comp imageLoad */
     ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -2066,7 +2163,15 @@ static VkResult create_app_image(DevNode *dev, Swapchain *sc, PerImage *pi) {
            tiling padding vkCmdClearColorImage can't reach. Created
            regardless of whether solid-fill is active this run (cheap,
            keeps this function simple); only used if it is. */
+        /* Same VUID-vkBindBufferMemory-memory-02726 requirement as
+           gob_dst_buf in create_gob_dest -- pi->memory was allocated with
+           OPAQUE_FD_BIT above (eai.handleTypes), so this buffer must
+           declare it too before being bound to that memory. */
+        VkExternalMemoryBufferCreateInfo embi = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO };
+        embi.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+
         VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+        bci.pNext = &embi;
         bci.size = mreq.size;
         bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -2570,7 +2675,21 @@ static bool create_gob_dest(DevNode *dev, Swapchain *sc, PerImage *pi) {
     VkDeviceSize exact_size = num_blocks * bytes_per_block;
     VkDeviceSize alloc_size = exact_size + exact_size / 4; /* +25% safety margin */
 
+    /* This buffer's memory is bound below with VK_EXTERNAL_MEMORY_HANDLE_
+       TYPE_OPAQUE_FD_BIT (for GetMemoryFdKHR/FLIP4 export) -- the spec
+       (VUID-vkBindBufferMemory-memory-02726) requires the buffer itself to
+       declare a matching VkExternalMemoryBufferCreateInfo up front, or
+       binding exportable memory to it is undefined behavior. Missing this
+       was found via the Khronos validation layer (2026-08-17, Play
+       emulator) after this exact gap caused VK_ERROR_DEVICE_LOST on real
+       hardware a few seconds into rendering -- validation flagged it
+       immediately even though llvmpipe and short-lived test apps never
+       surfaced it. */
+    VkExternalMemoryBufferCreateInfo embi = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO };
+    embi.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+
     VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    bci.pNext = &embi;
     bci.size = alloc_size;
     bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -3122,6 +3241,18 @@ layer_CreateSwapchainKHR(VkDevice device,
     sc->format  = ci->imageFormat;
     sc->color_space = ci->imageColorSpace;
     sc->present_mode = ci->presentMode;
+    {
+        /* FLIP_TEST_FORCE_FIFO: diagnostic override to force FIFO instead
+           of whatever the app requested, to test whether MAILBOX's
+           displaced-image semaphore bookkeeping (worker_post/QueuePresentKHR)
+           is implicated in a given bug, without touching app behavior. */
+        static int force_fifo = -1;
+        if (force_fifo < 0) {
+            const char *e = getenv("FLIP_TEST_FORCE_FIFO");
+            force_fifo = (e && atoi(e) != 0) ? 1 : 0;
+        }
+        if (force_fifo) sc->present_mode = VK_PRESENT_MODE_FIFO_KHR;
+    }
     sc->image_usage  = ci->imageUsage;
     pthread_mutex_init(&sc->lock, NULL);
 
@@ -3628,19 +3759,45 @@ layer_AcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain,
     if (!sc) return dev->d.AcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, pIndex);
 
     pthread_mutex_lock(&sc->lock);
-    /* Find the next free image. Round-robin among acquired==false images. */
+    /* Find the next free image. Round-robin among acquired==false images
+       that also aren't the worker's current pending slot (worker_pending_idx).
+
+       The pending-slot check matters only under MAILBOX: QueuePresentKHR
+       clears acquired=false immediately (before the worker has actually
+       consumed the image), so without it a fast MAILBOX app can re-acquire
+       and re-present the SAME image while its earlier post is still
+       sitting unconsumed in worker_pending_idx. worker_post's mailbox path
+       then "displaces" that same idx against itself: the image's
+       vk_render_done binary semaphore gets signaled a second time (by the
+       new post's own bridge submit) before the first signal is ever
+       waited on, which is undefined behaviour and was observed to hang the
+       GPU (nvgpu channel-timeout watchdog, not a crash) on real hardware --
+       2026-08-17, Play emulator, deterministic after ~8 frames. Confirmed
+       MAILBOX-specific: forcing FIFO (which blocks in worker_post until the
+       slot is actually drained, so this window can't open) made the hang
+       disappear entirely. Under FIFO this check is always false since a
+       slot is never both free and still pending. */
     uint32_t idx = sc->next_acquire;
     uint32_t tried = 0;
-    while (tried < sc->image_count && sc->images[idx].acquired) {
+    bool busy = true;
+    while (tried < sc->image_count) {
+        busy = sc->images[idx].acquired;
+        if (!busy) {
+            pthread_mutex_lock(&sc->worker_lock);
+            if (sc->worker_pending && sc->worker_pending_idx == idx) busy = true;
+            pthread_mutex_unlock(&sc->worker_lock);
+        }
+        if (!busy) break;
         idx = (idx + 1) % sc->image_count;
         tried++;
     }
-    if (tried == sc->image_count) {
+    if (busy) {
         pthread_mutex_unlock(&sc->lock);
         return VK_NOT_READY;
     }
     sc->images[idx].acquired = true;
     sc->next_acquire = (idx + 1) % sc->image_count;
+    TRACE_SYNC("acquire chosen idx=%u tried=%u", idx, tried);
 
     /* Reset our internal acquire_fence (it was either signaled-at-creation
        for the first N acquires, or signaled by the previous bridge submit). */
@@ -3658,6 +3815,7 @@ layer_AcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain,
     si.pWaitSemaphores      = &sc->images[idx].gl_sample_done;
     si.pWaitDstStageMask    = &stage;
     if (semaphore) { si.signalSemaphoreCount = 1; si.pSignalSemaphores = &semaphore; }
+    TRACE_SYNC("acquire idx=%u bridge submit: wait gl_sample_done", idx);
     VkResult r = queue_submit_locked(dev, dev->graphics_queue, 1, &si, sc->images[idx].acquire_fence);
     pthread_mutex_unlock(&sc->lock);
     if (r != VK_SUCCESS) {
@@ -3667,7 +3825,9 @@ layer_AcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain,
 
     /* CPU-block until our internal fence signals. This is the backpressure
        point that paces the app's render loop to actual presentation rate. */
+    TRACE_SYNC("acquire idx=%u WaitForFences(acquire_fence) begin", idx);
     r = dev->d.WaitForFences(dev->device, 1, &sc->images[idx].acquire_fence, VK_TRUE, timeout);
+    TRACE_SYNC("acquire idx=%u WaitForFences(acquire_fence) end ret=%d", idx, r);
     if (r == VK_TIMEOUT) return VK_TIMEOUT;
     if (r != VK_SUCCESS) {
         LOG_ERR("AcquireNextImageKHR: WaitForFences failed: %d", r);
@@ -3693,7 +3853,17 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL
 layer_QueueWaitIdle(VkQueue queue) {
     DevNode *dev = dev_lookup(dispatch_key(queue));
     if (!dev) return VK_ERROR_INITIALIZATION_FAILED;
+    /* vkQueueWaitIdle's queue parameter is externally synchronized too (same
+       spec requirement as vkQueueSubmit -- see the submit_lock comment on
+       DevNode). Without this lock, this call can run concurrently with our
+       worker thread's queue_submit_locked() bridge submits on the same
+       queue from the app's own thread, hitting the same Tegra driver race
+       that queue_submit_locked was built to prevent (observed as
+       DEVICE_LOST, 2026-08-17, Play emulator: its render thread calls
+       vkQueueWaitIdle while our worker submits the GOB compute pass). */
+    pthread_mutex_lock(&dev->submit_lock);
     VkResult r = dev->d.QueueWaitIdle(queue);
+    pthread_mutex_unlock(&dev->submit_lock);
     if (r != VK_SUCCESS) {
         LOG_ERR("vkQueueWaitIdle FAILED: ret=%d queue=%p", r, (void*)queue);
     }
@@ -4091,6 +4261,8 @@ layer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pInfo) {
         }
         bridge.signalSemaphoreCount = 1;
         bridge.pSignalSemaphores = &sc->images[idx].vk_render_done;
+        TRACE_SYNC("present idx=%u bridge submit: signal vk_render_done (appWaits=%u)",
+                   idx, bridge.waitSemaphoreCount);
         VkResult rb = queue_submit_locked(dev, queue, 1, &bridge, VK_NULL_HANDLE);
         if (rb != VK_SUCCESS) {
             pthread_mutex_unlock(&sc->lock);
@@ -4107,9 +4279,23 @@ layer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pInfo) {
            the previous image — that's the natural backpressure point.
            In MAILBOX mode this call returns immediately and reports back
            the index of any image whose place we just took, so we can
-           clean up its dangling semaphores before the next iteration. */
+           clean up its dangling semaphores before the next iteration.
+
+           sc->lock stays held through worker_post AND the displaced-image
+           drop-cleanup submit below (not released right after
+           acquired=false, as before) so a concurrent AcquireNextImageKHR
+           can never observe a displaced image in the gap between
+           worker_post() returning it and its drop-cleanup submit actually
+           signalling gl_sample_done -- that gap let a fast MAILBOX app
+           (multi-threaded acquire/present) re-acquire and re-present the
+           displaced image before its earlier vk_render_done signal had a
+           matching wait queued yet, double-signalling that binary
+           semaphore and hanging the GPU (nvgpu channel-timeout watchdog).
+           Found 2026-08-17, Play emulator: fixing only AcquireNextImageKHR's
+           own-pending-slot race (see its round-robin comment) pushed the
+           hang from frame ~8 to ~12 instead of eliminating it -- this was
+           the second half of the same race. */
         sc->images[idx].acquired = false;
-        pthread_mutex_unlock(&sc->lock);
 
         uint32_t present_id = 0;
         uint64_t desired_ns = 0;
@@ -4150,6 +4336,8 @@ layer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pInfo) {
             drop_si.pWaitDstStageMask    = &drop_stage;
             drop_si.signalSemaphoreCount = 1;
             drop_si.pSignalSemaphores    = &sc->images[displaced_idx].gl_sample_done;
+            TRACE_SYNC("present idx=%u drop-cleanup for displaced_idx=%u: wait vk_render_done, signal gl_sample_done",
+                       idx, displaced_idx);
             VkResult rd = queue_submit_locked(dev, queue, 1, &drop_si, VK_NULL_HANDLE);
             if (rd != VK_SUCCESS) {
                 LOG_ERR("QueuePresentKHR: mailbox drop cleanup submit failed: %d "
@@ -4159,6 +4347,7 @@ layer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pInfo) {
                    wanted. Best effort. */
             }
         }
+        pthread_mutex_unlock(&sc->lock);
 
         if (pInfo->pResults) pInfo->pResults[s] = VK_SUCCESS;
     }

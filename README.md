@@ -863,3 +863,161 @@ for whatever dolphin+gdb-specific issue it was, was never actually tested
 against the right combination -- the crash the user originally hit when
 starting a game normally (no gdb, layer loaded) was this fd-inheritance
 race the whole time, not the gdb/JIT artifact.
+
+## Update 2026-08-17 part 3: Play emulator — no rendered frames, GPU hang
+
+`~/Downloads/Play-Emulator-ARM64.AppImage --cdrom0` (a PS2 emulator, using
+`VK_KHR_xcb_surface` rather than Xlib -- the first app tested that does)
+showed a black window under the layer while reporting 60fps internally,
+where it renders normally without the layer. Not a pacing issue: FLIP4
+calls happened, just very sparsely at first glance, and the real content
+was never making it to screen.
+
+### Four real, independent bugs found along the way
+
+All four were found via the Khronos validation layer (an older
+1.3.204 build sideloaded from a mounted image, since no validation layer
+was installed system-side; `library_path` in its manifest needed patching
+to an absolute path, plus `libVkLayer_utils.so` alongside it) and via
+`dmesg`, which is what actually revealed the failure mode: `vkQueueSubmit`
+returning `VK_ERROR_DEVICE_LOST` (-4) cascading through everything
+afterward was just the symptom. The real signal was
+`nvgpu: gk20a_channel_timeout_handler: Job on channel N timed out` --
+a genuine GPU hang caught by the driver's own watchdog (~5s), not a page
+fault or crash. That distinction mattered: it pointed at a stuck
+GPU wait (a semaphore never signaled) rather than memory corruption.
+
+1. **`layer_QueueWaitIdle` wasn't taking `dev->submit_lock`.** Every other
+   queue touchpoint in this layer is deliberately serialized through that
+   per-device mutex (see its declaration comment, added earlier after a
+   similar PPSSPP bug) because `vkQueueWaitIdle`'s queue parameter is
+   externally synchronized too, same as `vkQueueSubmit`. Missed originally.
+   Fixed by wrapping the driver call in `submit_lock`.
+
+2. **`gob_dst_buf` and `flip_alias_buf` were missing
+   `VkExternalMemoryBufferCreateInfo`.** Both get memory allocated with
+   `VkExportMemoryAllocateInfo.handleTypes = OPAQUE_FD_BIT` bound to them,
+   but neither buffer declared a matching external-memory type at creation
+   -- `VUID-vkBindBufferMemory-memory-02726`, undefined behavior per spec.
+   Fixed by adding the missing struct to each buffer's `pNext`.
+
+3. **The app's rendered image never guaranteed `VK_IMAGE_USAGE_SAMPLED_BIT`.**
+   This is the most broadly significant of the four: `layer_CreateRenderPass`
+   /`CreateRenderPass2` rewrite every attachment's `PRESENT_SRC_KHR`
+   `finalLayout` to `SHADER_READ_ONLY_OPTIMAL` (needed so the worker can
+   read the app's content afterward) for *every* app using this layer, not
+   just Play -- but `create_app_image`'s `ici.usage` only added
+   `STORAGE_BIT` conditionally (GOB_REAL mode) and otherwise relied on
+   whatever usage the app itself requested for its swapchain, which most
+   apps don't include `SAMPLED_BIT` in (they don't normally sample their
+   own swapchain images). Per `VUID-vkCmdBeginRenderPass-initialLayout-00897`,
+   an attachment finalizing to `SHADER_READ_ONLY_OPTIMAL` requires the image
+   to have been created with `SAMPLED_BIT` or `INPUT_ATTACHMENT_BIT` --
+   without it, the Tegra driver's texture unit is plausibly missing tiling/
+   compression metadata it needs, which lines up with a hang rather than an
+   immediate error. Fixed by adding `SAMPLED_BIT` unconditionally.
+   Every other app tested apparently tolerated this by luck (fewer frames,
+   simpler content, or driver leniency) -- worth remembering if something
+   *else* eventually looks like an intermittent hang too.
+
+None of these four fixed Play's actual hang. That took isolating the
+failure to `present_mode == VK_PRESENT_MODE_MAILBOX_KHR` specifically
+(Play requests MAILBOX; every other app tested so far requests FIFO or
+MAILBOX-with-low-throughput) via a `FLIP_TEST_FORCE_FIFO` diagnostic
+override -- forcing FIFO made the hang disappear outright, pointing
+straight at `worker_post`'s MAILBOX "displaced image" bookkeeping
+(`QueuePresentKHR` / `worker_post` in `flip_layer.c`).
+
+### The real bug: gaps in the mailbox displacement bookkeeping
+
+MAILBOX mode lets `vkQueuePresentKHR` return immediately without blocking;
+if a new present arrives before the worker thread has picked up the
+previous one, the previous image is "displaced" and its
+`vk_render_done`/`gl_sample_done` binary semaphores need exactly one
+matching wait+signal cleanup so a later Acquire on it doesn't deadlock and
+a later Present's bridge submit doesn't try to signal an already-signaled
+binary semaphore. A binary semaphore's wait is claimed *in submission
+order* the instant a matching wait is issued to the queue, regardless of
+when it finishes executing -- if two submits both wait on the same
+once-signaled semaphore, whichever was issued second can never be
+satisfied. On this driver that manifests as a genuine GPU hang caught by
+the kernel's own watchdog (`nvgpu: gk20a_channel_timeout_handler: Job on
+channel N timed out`, ~5s), not a clean Vulkan error -- `DEVICE_LOST`
+cascading through everything afterward was just the downstream symptom.
+
+Getting "exactly one wait, exactly one signal" right against a fast
+MAILBOX app took five fixes, found in order as each one moved the failure
+point later instead of eliminating it (frame ~8 -> ~12 -> ~9 -> ~300 ->
+finally indefinite) -- the last two were only found by building a
+purpose-built trace tool (`FLIP_TEST_TRACE_SYNC=1`, a global sequence-
+numbered log of every touch of these semaphores with the calling thread's
+TID) after pure code reading stopped finding anything:
+
+1. **`AcquireNextImageKHR`'s round-robin only checked `acquired`, not
+   whether the candidate image was still `worker_pending_idx`.**
+   `QueuePresentKHR` clears `acquired=false` immediately (needed for
+   MAILBOX's non-blocking contract), so a fast app could re-acquire and
+   re-present the *same* image while its earlier post was still
+   unconsumed -- `worker_post` would then displace that idx against
+   itself, double-signaling its own `vk_render_done`. Fixed by also
+   checking `worker_pending && worker_pending_idx == idx` in the
+   round-robin's busy test.
+
+2. **`sc->lock` was released before `worker_post()` and the displaced-image
+   drop-cleanup submit.** This left a window where a concurrent
+   `AcquireNextImageKHR` could see a just-displaced image as neither
+   `acquired` nor `worker_pending_idx` -- free -- and re-acquire it before
+   the drop-cleanup submit had actually signaled its `gl_sample_done` yet.
+   Fixed by holding `sc->lock` through the entire displacement handling
+   (worker_post + drop-cleanup submit), not releasing it right after
+   `acquired=false`.
+
+3. **`worker_pending` stays `true` for a MAILBOX slot's *entire* frame** --
+   through the compute-shader dispatch, the `FLIP4` ioctl, and the vsync
+   wait -- and is only cleared at the very end, but the worker's own
+   consumption of that slot's semaphores happens much earlier, right after
+   the compute dispatch. The trace caught `worker_post(idx=2)` landing
+   *after* the worker had already fully drained idx=1's semaphores itself
+   but *before* `worker_pending` (still tracking the rest of idx=1's frame)
+   went false, displacing idx=1 anyway and double-signaling a
+   `gl_sample_done` the worker had already signaled. First fix: a second
+   flag, `worker_pending_sem_live`, cleared right after the worker's
+   semaphore-consuming submit *completed* (fence-confirmed) -- this only
+   made the hang far rarer (~9 frames of margin to ~300), not gone.
+
+4. **Root cause of #3's remaining gap**: clearing `worker_pending_sem_live`
+   after the submit *completes* is still too late -- the semaphore wait is
+   claimed when the submit is *issued*, not when it finishes. A second
+   trace catch: `worker_post(idx=0)` displacing idx=2 and issuing its
+   drop-cleanup wait on `vk_render_done` *before* the worker's own submit
+   for idx=2 had even been issued yet (both dequeue and command-buffer
+   recording take real, non-trivial CPU time) -- so the drop-cleanup's wait
+   claimed the signal first, and the worker's own subsequent wait for the
+   same semaphore could never be satisfied. Fixed by clearing
+   `worker_pending_sem_live` at submit-*issue* time instead of completion
+   time.
+
+5. **The actual root cause**: none of the above matters if the *dequeue*
+   itself doesn't claim the slot. Dequeuing a pending index already commits
+   the worker to consuming its semaphores unconditionally (once it reaches
+   the submit, which fix #4 handles) -- but between dequeue and that
+   submit there's real CPU work (window-geometry check, command buffer
+   recording), during which `worker_pending_sem_live` was still sitting at
+   its stale `true` value. A new `worker_post()` landing in that window
+   would displace the image the worker had *already dequeued and committed
+   to*, again racing the worker's own soon-to-be-issued wait. Fixed by
+   clearing `worker_pending_sem_live` at dequeue time, in the same locked
+   section as the dequeue itself (no intervening unlock/relock, which would
+   reopen the identical window) -- this made fix #4's clearing redundant,
+   so it was removed. This is the one that actually closed the race for
+   good.
+
+Confirmed fixed: Play now runs a full play session (300+ consecutive
+`FLIP4` calls, user played and closed it deliberately) under its native
+MAILBOX request with zero `DEVICE_LOST` errors, in the same run
+configuration (`FLIP_TEST_GOB_REAL=1`, no overrides) that previously hung
+within the first ~300 frames at best. `FLIP_TEST_FORCE_FIFO` and
+`FLIP_TEST_TRACE_SYNC` are kept as opt-in diagnostic env vars (both
+default off) since they were directly responsible for isolating and then
+pinpointing this bug and will likely be useful again for anything
+MAILBOX-shaped in the future.
