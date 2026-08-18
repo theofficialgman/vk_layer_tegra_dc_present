@@ -1621,6 +1621,25 @@ static void *worker_thread_main(void *arg) {
             __u32 kernel_wait_syncpt_val = 0;
             bool  kernel_wait_ok = false;
 
+            /* FLIP_TEST_WAIT_AFTER_FLIP=1: re-test moving the SGI vblank
+               wait to AFTER FLIP4 (see the "Wait for vblank HERE, right
+               before FLIP4" comment below for why it currently isn't) --
+               in case anything relevant has changed since that ordering
+               was established (GOB_REAL landing, driver updates, etc.).
+               Default (0) keeps the wait before FLIP4. Declared here,
+               above the kernel_pace/GLX-wait branch below, so both the
+               skip-if-set check inside that branch and the do-it-here
+               check after the FLIP4 call further down can see it. */
+            static int wait_after_flip = -1;
+            if (wait_after_flip < 0) {
+                const char *e = getenv("FLIP_TEST_WAIT_AFTER_FLIP");
+                wait_after_flip = (e && atoi(e) != 0) ? 1 : 0;
+                if (wait_after_flip)
+                    LOG_WARN("FLIP_TEST_WAIT_AFTER_FLIP=1: moving the SGI vblank "
+                             "wait to AFTER FLIP4 -- previously found to produce a "
+                             "consistent mid-frame tear, re-testing on purpose");
+            }
+
             if (sc->flip_kernel_pace) {
                 /* FLIP_TEST Option 1b: fully GLX-free pacing. Unlike FLIP4,
                  * this ioctl really does block the calling thread --
@@ -1690,7 +1709,8 @@ static void *worker_thread_main(void *arg) {
                  * unconditional; Option 1 only adds a second, hardware-
                  * precise gate on top (below), testing latch precision,
                  * not replacing pacing. */
-                if (sc->glXWaitVideoSyncSGI && sc->present_mode != VK_PRESENT_MODE_IMMEDIATE_KHR) {
+                if (!wait_after_flip &&
+                    sc->glXWaitVideoSyncSGI && sc->present_mode != VK_PRESENT_MODE_IMMEDIATE_KHR) {
                     unsigned int count = 0;
                     if (sc->glXGetVideoSyncSGI(&count) == 0)
                         sc->glXWaitVideoSyncSGI(2, (count + 1) & 1, &count);
@@ -1863,6 +1883,19 @@ static void *worker_thread_main(void *arg) {
             }
             if (_f4_ret < 0)
                 LOG_WARN("FLIP_TEST: FLIP4 failed: %m");
+
+            /* FLIP_TEST_WAIT_AFTER_FLIP=1 counterpart to the skip above --
+               see that comment and the "Wait for vblank HERE, right before
+               FLIP4" comment further up for the reasoning being re-tested. */
+            if (wait_after_flip &&
+                sc->glXWaitVideoSyncSGI && sc->present_mode != VK_PRESENT_MODE_IMMEDIATE_KHR) {
+                unsigned int count = 0;
+                if (sc->glXGetVideoSyncSGI(&count) == 0)
+                    sc->glXWaitVideoSyncSGI(2, (count + 1) & 1, &count);
+                else
+                    sc->glXWaitVideoSyncSGI(2, 0, &count);
+            }
+
             /* tegra_dc_ioctl() (dev.c) uses post_syncpt_fd as an OUTPUT
              * slot, not just input: with no explicit user_data syncpt
              * request (we send none), it creates a brand new post-flip

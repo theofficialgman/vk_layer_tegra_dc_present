@@ -109,6 +109,12 @@ to leave unset for normal use.
   Kept for reference; not recommended over the default.
 - `FLIP_TEST_DELAY_US=<us>` -- extra sleep inserted right before `FLIP4`,
   after the SGI wait. Used for a manual vblank-phase timing sweep.
+- `FLIP_TEST_WAIT_AFTER_FLIP=1` -- moves the SGI vblank wait to *after*
+  `FLIP4` instead of before (the default). Originally found to cause a
+  consistent mid-frame tear; re-tested 2026-08-18 and stayed tear-free
+  against two apps on the driver in use at the time (see "Update
+  2026-08-18") -- possibly driver-version-dependent. Not the default;
+  needs a longer soak test before trusting it over the current ordering.
 
 **Debugging**
 - `FLIP_TEST_TRACE_SYNC=1` -- logs a global sequence-numbered trace of
@@ -1237,3 +1243,34 @@ while its old swapchain is one of ours) still works correctly too --
 re-tested with `vkgears -fullscreen`'s own internal 300x300 -> 2560x1600
 swapchain recreation, still engages FLIP4 tear-free on both swapchains
 with no orphaned worker thread.
+
+## Update 2026-08-18: re-testing the SGI wait ordering (FLIP_TEST_WAIT_AFTER_FLIP)
+
+Earlier in this investigation (see the "Wait for vblank HERE, right before
+FLIP4, instead of after" comment in `worker_thread_main`), moving the SGI
+vblank wait to *before* `FLIP4` instead of after was found to fix a
+consistent mid-frame tear -- calling `FLIP4` at an arbitrary phase
+(whenever the GPU copy/compute step happened to finish) rather than right
+after a known vblank edge gave the driver less lead time to latch the new
+buffer before the *next* vblank.
+
+Re-tested 2026-08-18 with a new opt-in toggle, `FLIP_TEST_WAIT_AFTER_FLIP=1`
+(moves the wait back to after `FLIP4`, the original ordering), against both
+`vkgears -fullscreen` and `~/Vulkan/build/bin/gears -f -vs`: **both stayed
+tear-free** in this session's testing, contradicting the earlier result.
+The most likely explanation is the NVIDIA driver was changed at some point
+during this investigation (mentioned by the user mid-session) -- the
+original mid-frame-tear finding may be specific to whichever driver
+version was in use when it was established, not a universal property of
+this hardware/ioctl combination.
+
+**Not changed as the default** -- kept as an opt-in diagnostic toggle
+rather than flipping the default, since this session's re-test was
+relatively short (tens of seconds per app) and several other bugs in this
+investigation (the MAILBOX displacement race, in particular) only
+surfaced after much longer runs or specific timing conditions that a short
+test can miss. If this ordering does turn out to reduce latency
+meaningfully without reintroducing tearing under extended/varied testing,
+revisit making it the default -- but that needs a longer soak test first,
+ideally across more than one app and more than a few minutes, before
+trusting it over the currently-default, more conservative ordering.
