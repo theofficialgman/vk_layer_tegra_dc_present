@@ -3433,6 +3433,40 @@ layer_CreateSwapchainKHR(VkDevice device,
         }
     }
 
+    /* IMMEDIATE MODE GATE: VK_PRESENT_MODE_IMMEDIATE_KHR means the app
+       explicitly does not want vsync and explicitly accepts tearing --
+       there is no tearing problem for this layer to fix for that app, and
+       our own pipeline (per-frame compute-shader GOB conversion, a
+       synchronous tegra_dc_ext_pin_windows() inside every FLIP4 ioctl,
+       extra semaphore/fence round-trips for the Acquire/Present bridge)
+       has real, unavoidable per-frame CPU/GPU cost on top of whatever the
+       app's own rendering takes -- pure overhead for an app that
+       explicitly asked to skip vsync for maximum throughput and doesn't
+       care about tearing. Found 2026-08-18: `gears -f` (fullscreen,
+       without `-vs`, requesting IMMEDIATE) ran at ~417fps under this
+       layer versus ~700fps natively -- a large, real throughput
+       regression with zero benefit to that app, since it already accepts
+       tearing by asking for IMMEDIATE in the first place. Falls through
+       to native passthrough WSI, exactly like the fullscreen gate above,
+       for the same reason: no benefit to this app from engaging FLIP4,
+       real cost from doing so anyway. FLIP_TEST_ALLOW_IMMEDIATE=1
+       overrides this for testing FLIP4 against an IMMEDIATE-mode
+       swapchain specifically. */
+    if (ci->presentMode == VK_PRESENT_MODE_IMMEDIATE_KHR) {
+        static int allow_immediate = -1;
+        if (allow_immediate < 0) {
+            const char *e = getenv("FLIP_TEST_ALLOW_IMMEDIATE");
+            allow_immediate = (e && atoi(e) != 0) ? 1 : 0;
+        }
+        if (!allow_immediate) {
+            LOG_INFO("CreateSwapchainKHR: app requested VK_PRESENT_MODE_IMMEDIATE_KHR (no "
+                     "vsync, tearing accepted); falling through to native WSI -- FLIP4 has "
+                     "no benefit and real per-frame overhead for an app that doesn't want "
+                     "vsync anyway, see README.md. Set FLIP_TEST_ALLOW_IMMEDIATE=1 to override.");
+            return fallback_to_native_swapchain(dev, device, ci, surf, pAlloc, pOut);
+        }
+    }
+
     /* Clamp image count to our range. FLIP_TEST_MIN_IMAGES, if set, FORCES
      * want to exactly that value regardless of what the app itself
      * requested via ci->minImageCount -- not just a floor that only raises

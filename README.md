@@ -82,6 +82,11 @@ to leave unset for normal use.
   "Update 2026-08-17 part 4") to test the FLIP4 path itself against a
   non-fullscreen window. The overlay's position will be wrong and it won't
   respect window occlusion -- diagnostic only, never for normal use.
+- `FLIP_TEST_ALLOW_IMMEDIATE=1` -- override the IMMEDIATE mode gate (see
+  "Update 2026-08-18 part 2") to test the FLIP4 path itself against a
+  `VK_PRESENT_MODE_IMMEDIATE_KHR` swapchain. Real per-frame overhead with
+  no tearing benefit for an app that already accepts tearing -- diagnostic
+  only, never for normal use.
 
 **Buffering / pacing**
 - `FLIP_TEST_MIN_IMAGES=<N>` -- forces the swapchain image count to
@@ -1282,3 +1287,40 @@ MAILBOX displacement race, in particular) only surfaced after much longer
 runs or specific timing conditions a short test can miss, so this default
 is a deliberate, informed bet rather than an exhaustively-soaked
 guarantee.
+
+## Update 2026-08-18 part 2: IMMEDIATE mode -- FLIP4 has no benefit, real cost
+
+`~/Vulkan/build/bin/gears -f` (fullscreen, *without* `-vs` -- no vsync)
+showed two symptoms under this layer: ran at ~417fps versus ~700fps
+natively, and took ~10 seconds to actually exit after closing the window
+(not a true hang, just a long delay).
+
+Root cause of both, in one place: the app requests
+`VK_PRESENT_MODE_IMMEDIATE_KHR` (confirmed via log:
+`present_mode=0`) -- meaning it explicitly does not want vsync and
+explicitly accepts tearing. There is no tearing problem for this layer to
+fix for that app. But engaging FLIP4 anyway still costs real, unavoidable
+per-frame overhead on top of the app's own rendering: the GOB compute-
+shader conversion, a *synchronous* `tegra_dc_ext_pin_windows()` inside
+every `FLIP4` ioctl call (confirmed ~12ms on the first few calls of a
+fresh run in the log capture, dropping to sub-millisecond once buffers are
+already pinned), and extra semaphore/fence round-trips for the
+Acquire/Present bridge. For an app that already accepts tearing and wants
+maximum throughput, that's pure cost with zero benefit -- exactly the
+~40% fps regression observed. The slow-close symptom most likely followed
+from the same root cause (running the full FLIP4 pipeline -- worker
+thread, per-frame GPU work, ioctls -- unnecessarily) rather than being a
+separate bug; it was not investigated further in isolation since the fix
+below eliminated it too.
+
+**Fix: extended the existing FULLSCREEN GATE pattern with an IMMEDIATE
+MODE GATE.** `VK_PRESENT_MODE_IMMEDIATE_KHR` swapchains now fall through
+to native passthrough WSI unconditionally, the same way non-fullscreen
+windows already did -- no benefit to that app from engaging FLIP4, real
+cost from doing so anyway. `FLIP_TEST_ALLOW_IMMEDIATE=1` overrides this
+for testing the FLIP4 path itself against an IMMEDIATE-mode swapchain.
+Confirmed fixed: `gears -f` now correctly bypasses FLIP4 (log:
+"app requested VK_PRESENT_MODE_IMMEDIATE_KHR... falling through to native
+WSI"), fps is back to normal, and the close delay is gone -- both
+user-confirmed. Matches the user's own stated expectation going in: "I
+pretty much expect the layer to not be active when vsync isn't enabled."
