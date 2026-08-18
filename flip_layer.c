@@ -3331,19 +3331,31 @@ layer_CreateSwapchainKHR(VkDevice device,
         }
     }
 
-    /* Clamp image count to our range (MIN_IMAGES=3, see its definition).
-     * FLIP_TEST_MIN_IMAGES: optional override to force even more images
-     * than requested, for further margin testing. */
+    /* Clamp image count to our range. FLIP_TEST_MIN_IMAGES, if set, FORCES
+     * want to exactly that value regardless of what the app itself
+     * requested via ci->minImageCount -- not just a floor that only raises
+     * it. A pure floor can't actually be used to test fewer images than an
+     * app already requests on its own (e.g. vkgears now requests 3 by
+     * default, matching MIN_IMAGES, so a floor override has nothing left
+     * to lower) -- an exact force is what's needed to deliberately re-test
+     * below the default safety floor (MIN_IMAGES=3, raised from 2 after
+     * "2-image swapchains are unsafe", see README.md, Update 2026-08-17)
+     * on demand, without a source edit, against whichever app you want to
+     * point it at. */
     uint32_t want = ci->minImageCount;
     {
-        static long force_min = -1;
-        if (force_min < 0) {
+        static long force_count = -2;   /* -2 = not yet read, -1 = confirmed unset */
+        if (force_count == -2) {
             const char *e = getenv("FLIP_TEST_MIN_IMAGES");
-            force_min = e ? atol(e) : 0;
+            force_count = e ? atol(e) : -1;
+            if (e && force_count < MIN_IMAGES)
+                LOG_WARN("FLIP_TEST_MIN_IMAGES=%ld is below the default safety floor "
+                         "of %d -- re-enabling the confirmed 2-image tearing bug on "
+                         "purpose, see README.md", force_count, MIN_IMAGES);
         }
-        if (force_min > 0 && (uint32_t)force_min > want) want = (uint32_t)force_min;
+        if (force_count >= 0) want = (uint32_t)force_count;
+        else if (want < MIN_IMAGES) want = MIN_IMAGES;
     }
-    if (want < MIN_IMAGES) want = MIN_IMAGES;
     if (want > MAX_IMAGES) want = MAX_IMAGES;
 
     /* Reject formats we don't support. */

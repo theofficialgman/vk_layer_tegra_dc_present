@@ -84,10 +84,14 @@ to leave unset for normal use.
   respect window occlusion -- diagnostic only, never for normal use.
 
 **Buffering / pacing**
-- `FLIP_TEST_MIN_IMAGES=<N>` -- force at least `N` swapchain images. The
-  built-in floor is already 3 (raised from 2 after "2-image swapchains are
-  unsafe", see "Update 2026-08-17"); this only matters for testing higher
-  counts.
+- `FLIP_TEST_MIN_IMAGES=<N>` -- forces the swapchain image count to
+  exactly `N`, overriding both the app's own request and the built-in
+  safety floor (3, raised from 2 after "2-image swapchains are unsafe",
+  see "Update 2026-08-17"). Works in both directions: `N` above what the
+  app requests raises it for margin testing, `N` below the floor
+  (including back down to 2) deliberately re-enables the confirmed
+  2-image tearing bug on demand, e.g. to re-verify it against a specific
+  app without a source edit. Logs a warning when going below the floor.
 - `FLIP_TEST_FORCE_FIFO=1` -- force FIFO present mode regardless of what
   the app requests, for isolating whether a bug is specific to MAILBOX's
   displaced-image bookkeeping (see "Update 2026-08-17 part 3").
