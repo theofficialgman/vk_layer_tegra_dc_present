@@ -1604,3 +1604,42 @@ entry. `CreateInstance`'s required list is down to
 Verified with `gears -f -vs`: `CreateDevice: appending 2 required
 extensions` (down from 6), full clean run, fullscreen detection and FLIP4
 unaffected.
+
+## Update 2026-08-19 part 3: dead-field audit -- XChangeProperty, and three
+never-used/never-set Swapchain fields
+
+Systematic pass over every function in `X11_FUNCS`/`GL_FUNCS`/`GLX_FUNCS`/
+`XRANDR_FUNCS` and every struct field, checking for real call/read sites
+rather than just the resolve/declare boilerplate. Found and removed:
+
+- **`XChangeProperty`** -- zero real call sites. The section it belonged to
+  ("Surface bypass-compositor hint") was an empty header with no code
+  under it -- whatever once set a `_NET_WM_BYPASS_COMPOSITOR`-style hint
+  was removed at some point, leaving the resolve entry and the stray
+  section header behind. Removed both.
+- **`Swapchain.cpool`** -- declared and documented ("Per-swapchain command
+  pool for our bridge submits") but never assigned or used anywhere.
+- **`PerImage.in_flight`** -- declared and documented but never read or
+  written anywhere.
+- **`DevNode.idisp` / `DevNode.inst`** -- write-only: assigned once in
+  `CreateDevice`, never read anywhere. (The `InstNode` lookup that
+  populated them stayed -- it's also needed for
+  `GetPhysicalDeviceMemoryProperties`, a genuine use the removal almost
+  broke; caught immediately by the compiler.)
+- **`DEFAULT_IMAGES`** and the **`DECL_REMAP`/`REMAP`** macro pair --
+  defined then immediately `#undef`'d with a comment admitting they were
+  unused, right next to the actual (different) mechanism that replaced
+  them.
+
+**`Swapchain.flip_ready`** was a different case -- not just dead, but a
+real behavioral gap. It gated a "disable the FLIP4 window before tearing
+down, so no stale frame is left visible" cleanup `ioctl` in
+`worker_thread_main`'s shutdown path, but was never set `true` anywhere in
+the codebase's history (confirmed via `git log -S "flip_ready = true"`
+across all commits -- no match). That cleanup step has silently never
+executed. Asked the user whether to wire it up (set it once the DC window
+is successfully claimed) or remove the dead block; chose removal -- the
+block and the field are gone.
+
+Verified with `gears -f -vs` after each removal: clean full-length runs,
+no errors, fullscreen detection and FLIP4 unaffected throughout.

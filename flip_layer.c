@@ -359,13 +359,6 @@ static bool lib_load(void) {
 /* Source-level redirection: every callsite below that says glXXX(...) or
    XXX(...) for X11 functions becomes g_libs.glXXX(...) without source
    changes. */
-#define DECL_REMAP(name, ret, args) static const PFN_##name name##_indirect = NULL; (void)name##_indirect;
-/* The above is unused; what we really want is a per-name #define. */
-#undef DECL_REMAP
-
-#define REMAP(name, ret, args) static inline ret name args;
-/* Also unused — we just use the literal macros below. */
-#undef REMAP
 
 #define XInitThreads              (g_libs.XInitThreads)
 #define XOpenDisplay              (g_libs.XOpenDisplay)
@@ -430,9 +423,6 @@ static bool lib_load(void) {
  * (~50ms/3-vblank gap) fixed it with no other change. See README.md. */
 #define MIN_IMAGES   3
 #define MAX_IMAGES   8
-
-/* Default image count if the app requests something outside the range. */
-#define DEFAULT_IMAGES 3
 
 /* ----------------------------------------------------------------------- */
 /* Logging                                                                 */
@@ -671,9 +661,7 @@ typedef struct DevNode {
        handle cleanup of state created by layer_CreateXlibSurfaceKHR /
        layer_CreateXcbSurfaceKHR (the icd_surface in our Surface*). */
     bool passthrough;
-    VkInstance inst;
     DeviceDispatch d;
-    InstanceDispatch *idisp;     /* points into the InstNode for this device */
     VkPhysicalDeviceMemoryProperties memp;
     uint32_t graphics_qfi;
     VkQueue graphics_queue;      /* lazy-resolved */
@@ -908,7 +896,6 @@ typedef struct PerImage {
        requests image idx, we make the app's acquire semaphore wait on
        gl_sample_done[idx] via a bridge submit. */
     bool             acquired;        /* currently held by app */
-    bool             in_flight;       /* worker has copy/present work pending on it */
 } PerImage;
 
 typedef struct Swapchain {
@@ -979,9 +966,6 @@ typedef struct Swapchain {
     /* Acquire ring */
     uint32_t      next_acquire;       /* round-robin starting point */
 
-    /* Per-swapchain command pool for our bridge submits. */
-    VkCommandPool  cpool;
-
     /* Async present worker.
 
        Architecture: a dedicated thread owns the GLX context — made current
@@ -1032,7 +1016,6 @@ typedef struct Swapchain {
                                  see the comment where flip_dc_fd is opened */
     VkCommandPool flip_cpool;
     uint32_t flip_out_w, flip_out_h; /* clamped to fit the screen, 1:1 */
-    bool     flip_ready;
 
     /* Renders real per-frame content through the verified GOB block-linear
      * compute shader (gob_swizzle.comp) -- confirmed tear-free, correct
@@ -1576,20 +1559,6 @@ static void *worker_thread_main(void *arg) {
         pthread_mutex_unlock(&sc->worker_lock);
     }
 
-    if (sc->flip_ready) {
-        /* Disable the window before tearing down -- leaves no visible
-         * leftover content on screen. */
-        struct tegra_dc_ext_flip_windowattr win = {0};
-        win.index = sc->flip_win_index;
-        win.buff_id = 0;
-        win.pre_syncpt_id = FLIP_TEST_NVSYNCPT_INVALID;
-        struct tegra_dc_ext_flip_4 flip = {0};
-        flip.win = (__u64)(uintptr_t)&win;
-        flip.win_num = 1;
-        flip.post_syncpt_fd = -1;
-        ioctl(sc->flip_dc_fd, TEGRA_DC_EXT_FLIP4, &flip);
-        if (flip.post_syncpt_fd >= 0) close(flip.post_syncpt_fd); /* see the per-frame call's comment */
-    }
     if (sc->flip_dc_fd >= 0) close(sc->flip_dc_fd);
 
     glXMakeCurrent(sc->worker_dpy, None, NULL);
@@ -4026,8 +3995,6 @@ layer_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInfo *ci,
     node->device = *pDev;
     node->phys = phys;
     node->key = dispatch_key(*pDev);
-    node->idisp = in ? &in->d : NULL;
-    node->inst = in ? in->instance : VK_NULL_HANDLE;
 
 #define D(name) node->d.name = (PFN_vk##name)next_gdpa(*pDev, "vk" #name)
     D(GetDeviceProcAddr);
