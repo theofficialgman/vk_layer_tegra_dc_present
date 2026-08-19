@@ -224,7 +224,6 @@
     M(XGetWindowAttributes, Status, (Display *, Window, XWindowAttributes *)) \
     M(XResizeWindow,     int,     (Display *, Window, unsigned, unsigned)) \
     M(XFlush,            int,     (Display *)) \
-    M(XChangeProperty,   int,     (Display *, Window, Atom, Atom, int, int, const unsigned char *, int)) \
     M(XTranslateCoordinates, Bool, (Display *, Window, Window, int, int, int *, int *, Window *)) \
     M(XGetWindowProperty, int,    (Display *, Window, Atom, long, long, Bool, Atom, Atom *, int *, unsigned long *, unsigned long *, unsigned char **)) \
     M(XQueryTree,        Status,  (Display *, Window, Window *, Window *, Window **, unsigned int *)) \
@@ -382,7 +381,6 @@ static bool lib_load(void) {
 #define XGetWindowAttributes      (g_libs.XGetWindowAttributes)
 #define XResizeWindow             (g_libs.XResizeWindow)
 #define XFlush                    (g_libs.XFlush)
-#define XChangeProperty           (g_libs.XChangeProperty)
 #define XTranslateCoordinates     (g_libs.XTranslateCoordinates)
 #define XGetWindowProperty        (g_libs.XGetWindowProperty)
 #define XQueryTree                (g_libs.XQueryTree)
@@ -2331,10 +2329,6 @@ static void destroy_perimage(DevNode *dev, Swapchain *sc, PerImage *pi) {
     memset(pi, 0, sizeof(*pi));
     pi->gob_dst_fd = -1;
 }
-
-/* ----------------------------------------------------------------------- */
-/* Surface bypass-compositor hint                                          */
-/* ----------------------------------------------------------------------- */
 
 /* ----------------------------------------------------------------------- */
 /* Surface hooks                                                           */
