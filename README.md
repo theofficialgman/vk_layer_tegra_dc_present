@@ -1550,3 +1550,57 @@ Also removed the now-fully-unused `MapMemory`/`UnmapMemory`/
 `CmdClearColorImage`/`CmdFillBuffer`/`CmdCopyImage`/
 `GetImageSubresourceLayout` entries from the device dispatch table --
 each was used only by one of the paths above.
+
+## Update 2026-08-19 part 2: removed VK_GOOGLE_display_timing and other
+unused extension plumbing
+
+`VK_GOOGLE_display_timing` isn't supported out of the box by this driver,
+so emulating it (a 64-entry timing ring, EWMA refresh-duration tracking
+from observed vblank intervals, `VkPresentTimesInfoGOOGLE` pNext parsing
+in `QueuePresentKHR`) was pure unused surface area -- no app was ever
+going to request an extension this driver doesn't advertise natively, and
+the layer's own manifest was the only thing making it visible at all.
+Removed entirely: `layer_GetRefreshCycleDurationGOOGLE`,
+`layer_GetPastPresentationTimingGOOGLE`, the `timing_lock`/`timing_count`/
+`timing_head`/`timing_ring`/`refresh_duration_ns` `Swapchain` fields, the
+vblank-timestamp-capture-and-EWMA block and `VkPresentTimesInfoGOOGLE`
+pNext walk in the worker/`QueuePresentKHR`, `worker_post`'s
+`present_id`/`desired_ns` parameters, and the `VK_GOOGLE_display_timing`
+entry from both `flip_layer.json` and the installed system/Flatpak
+manifests.
+
+Also removed, per the "What actually looks unused" findings from
+summarizing the layer's current extension usage -- each confirmed dead by
+grepping for any real call site, not just by inspection:
+- `VK_KHR_external_semaphore` / `VK_KHR_external_semaphore_fd` /
+  `VK_KHR_external_semaphore_capabilities`, and the `GetSemaphoreFdKHR`
+  entrypoint -- the semaphore-export design was already dead per the
+  code's own long-standing comment ("this prototype stays entirely in
+  Vulkan... there's nothing to export"), a leftover from before this file
+  was stripped of GL interop entirely.
+- `VK_KHR_dedicated_allocation` / `VK_KHR_get_memory_requirements2` --
+  `VkMemoryDedicatedAllocateInfo` isn't constructed anywhere (the code
+  that used it was removed in part 1 of today's cleanup); only the core
+  1.0 `vkGetImageMemoryRequirements`/`vkGetBufferMemoryRequirements` are
+  ever called, never the `...2` variants -- true regardless of driver
+  version, since the base functions are always present on any conformant
+  Vulkan driver.
+- `GetPhysicalDeviceImageFormatProperties2` and
+  `GetPhysicalDeviceExternalSemaphoreProperties` -- resolved at
+  `CreateInstance` but never actually called anywhere.
+- `InstNode.external_mem_caps` / `external_sem_caps` -- declared, never
+  read or written.
+
+`CreateDevice`'s required-extension list is now just `VK_KHR_external_memory`
++ `VK_KHR_external_memory_fd` (for `GetMemoryFdKHR`, exporting
+`gob_dst_buf`'s memory as the dma-buf fd handed to FLIP4) -- down from 6.
+The "strip layer-provided extensions the ICD doesn't implement" mechanism
+in `CreateDevice` is gone too: `VK_GOOGLE_display_timing` was its only
+entry. `CreateInstance`'s required list is down to
+`VK_KHR_external_memory_capabilities` + `VK_KHR_get_physical_device_properties2`
+(the latter still genuinely used by `GetPhysicalDeviceSurfaceCapabilities2KHR`/
+`SurfaceFormats2KHR`, which the layer does implement).
+
+Verified with `gears -f -vs`: `CreateDevice: appending 2 required
+extensions` (down from 6), full clean run, fullscreen detection and FLIP4
+unaffected.
