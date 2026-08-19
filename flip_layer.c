@@ -229,7 +229,9 @@
     M(XFlush,            int,     (Display *)) \
     M(XChangeProperty,   int,     (Display *, Window, Atom, Atom, int, int, const unsigned char *, int)) \
     M(XTranslateCoordinates, Bool, (Display *, Window, Window, int, int, int *, int *, Window *)) \
-    M(XGetWindowProperty, int,    (Display *, Window, Atom, long, long, Bool, Atom, Atom *, int *, unsigned long *, unsigned long *, unsigned char **))
+    M(XGetWindowProperty, int,    (Display *, Window, Atom, long, long, Bool, Atom, Atom *, int *, unsigned long *, unsigned long *, unsigned char **)) \
+    M(XQueryTree,        Status,  (Display *, Window, Window *, Window *, Window **, unsigned int *)) \
+    M(XGetAtomName,      char*,   (Display *, Atom))
 
 /* FLIP_TEST: runtime DC auto-detection (detect_dc_for_window). Resolved the
  * same dlopen+dlsym way as X11_FUNCS, for the same reason (avoids the
@@ -386,6 +388,8 @@ static bool lib_load(void) {
 #define XChangeProperty           (g_libs.XChangeProperty)
 #define XTranslateCoordinates     (g_libs.XTranslateCoordinates)
 #define XGetWindowProperty        (g_libs.XGetWindowProperty)
+#define XQueryTree                (g_libs.XQueryTree)
+#define XGetAtomName               (g_libs.XGetAtomName)
 
 #define XRRGetScreenResourcesCurrent (g_libs.XRRGetScreenResourcesCurrent)
 #define XRRFreeScreenResources       (g_libs.XRRFreeScreenResources)
@@ -846,6 +850,13 @@ typedef struct Surface {
     /* The GLX context lives in the SwapchainData, not here, because it
        must match the GLXFBConfig of the rendering format and the app
        chooses format at swapchain creation time. */
+    /* Temporary debug aid (see debug_log_fullscreen_sample) -- when this
+       surface was created and when we last logged a fullscreen-state
+       sample for it, so calls piggybacked on the app's own thread (e.g.
+       GetPhysicalDeviceSurfaceCapabilitiesKHR) can throttle to ~200ms and
+       stop after 10s without a separate polling thread. */
+    struct timespec debug_create_time;
+    struct timespec debug_last_log_time;
 } Surface;
 
 #define SURFACE_MAGIC 0x53524654594c5253ULL  /* "SRFTYLSR" backwards-ish */
@@ -2887,17 +2898,32 @@ fail_buf:
 }
 
 /* Checks whether the window manager has the EWMH _NET_WM_STATE_FULLSCREEN
- * atom set on this window -- the semantically correct signal for "this is
- * genuinely exclusive fullscreen," as opposed to merely maximized (which
- * sets _NET_WM_STATE_MAXIMIZED_VERT/_HORZ instead, not this atom). Modern
+ * atom set on this window OR any of its ancestors, up to the root -- the
+ * semantically correct signal for "this is genuinely exclusive fullscreen,"
+ * as opposed to merely maximized (which sets
+ * _NET_WM_STATE_MAXIMIZED_VERT/_HORZ instead, not this atom). Modern
  * WM-managed apps (SDL, GLFW, Qt, etc.) set this correctly when they
  * request real fullscreen. Combined with the exact CRTC-size/position
  * match in detect_dc_for_window below as a second, independent signal --
  * belt and suspenders against a maximized window that happens to size-
  * match its display exactly too (some WMs strip decorations on maximize,
- * making size alone ambiguous). Returns false (conservatively: not
- * fullscreen) on any query failure, e.g. no _NET_WM_STATE support at all
- * (no WM running, or an override-redirect window bypassing WM interaction
+ * making size alone ambiguous).
+ *
+ * Walking ancestors matters: confirmed 2026-08-18 (azahar/Citra, Qt-based)
+ * that the window handed to vkCreateXlibSurfaceKHR can be a plain rendering
+ * child of the actual WM-managed top-level, one level up in the X11 window
+ * tree -- per EWMH, only that WM-managed top-level ever gets _NET_WM_STATE
+ * set on it, never a rendering child, so checking `win` alone returned
+ * false forever on that app even though `xprop` on the real top-level
+ * showed _NET_WM_STATE_FULLSCREEN correctly set (verified directly, not a
+ * timing race: the window was already resized to the exact display
+ * resolution 1.5+ seconds earlier). Bounded to 8 levels, stopping at the
+ * root, so a pathological window tree can't turn this into an unbounded
+ * walk.
+ *
+ * Returns false (conservatively: not fullscreen) if no ancestor up to the
+ * root has the atom set, e.g. no _NET_WM_STATE support at all (no WM
+ * running, or an override-redirect window bypassing WM interaction
  * entirely) -- fails toward the native-WSI fallback rather than risking a
  * wrong occlusion/position guess. */
 static bool is_wm_fullscreen(Display *dpy, Window win) {
@@ -2905,24 +2931,143 @@ static bool is_wm_fullscreen(Display *dpy, Window win) {
     Atom fs_atom = XInternAtom(dpy, "_NET_WM_STATE_FULLSCREEN", True);
     if (state_atom == None || fs_atom == None) return false;
 
-    Atom actual_type;
-    int actual_format;
-    unsigned long nitems, bytes_after;
-    unsigned char *prop = NULL;
-    if (XGetWindowProperty(dpy, win, state_atom, 0, 1024, False, XA_ATOM,
-                            &actual_type, &actual_format, &nitems, &bytes_after,
-                            &prop) != Success || !prop) {
-        return false;
-    }
-    bool found = false;
-    if (actual_type == XA_ATOM && actual_format == 32) {
-        Atom *atoms = (Atom *)prop;
-        for (unsigned long i = 0; i < nitems; i++) {
-            if (atoms[i] == fs_atom) { found = true; break; }
+    Window cur = win;
+    for (int depth = 0; depth < 8; depth++) {
+        Atom actual_type;
+        int actual_format;
+        unsigned long nitems, bytes_after;
+        unsigned char *prop = NULL;
+        if (XGetWindowProperty(dpy, cur, state_atom, 0, 1024, False, XA_ATOM,
+                                &actual_type, &actual_format, &nitems, &bytes_after,
+                                &prop) == Success && prop) {
+            if (actual_type == XA_ATOM && actual_format == 32) {
+                Atom *atoms = (Atom *)prop;
+                for (unsigned long i = 0; i < nitems; i++) {
+                    if (atoms[i] == fs_atom) { XFree(prop); return true; }
+                }
+            }
+            XFree(prop);
         }
+        Window root, parent; Window *children = NULL; unsigned int nchildren = 0;
+        if (!XQueryTree(dpy, cur, &root, &parent, &children, &nchildren)) break;
+        if (children) XFree(children);
+        if (parent == 0 || parent == root) break; /* reached the root */
+        cur = parent;
     }
+    return false;
+}
+
+static void window_size(Surface *s, uint32_t *w, uint32_t *h); /* defined below */
+
+/* Temporary debug aid: the fullscreen gate in CreateSwapchainKHR (size match
+ * + is_wm_fullscreen) is evaluated exactly once, at swapchain-creation time
+ * -- there is no retry if the WM hasn't finished applying fullscreen yet
+ * (async _NET_WM_STATE + resize). To see whether that race is actually what
+ * a given app is hitting, this polls the raw window state every 200ms for
+ * 10 seconds starting at CreateXlibSurfaceKHR/CreateXcbSurfaceKHR (before
+ * the app has necessarily even called CreateSwapchainKHR yet) and logs each
+ * sample at LOG_INFO, independent of whatever CreateSwapchainKHR itself
+ * decides. Captures dpy/window by value, not the Surface*, so it keeps
+ * working even if the app destroys/recreates the surface mid-poll. */
+/* Logs the raw _NET_WM_STATE atom list (by name, not just whether FULLSCREEN
+ * is in it) for one window -- lets us see e.g. an empty/missing property
+ * distinctly from one that's present but doesn't contain FULLSCREEN, or
+ * catch a type/format mismatch is_wm_fullscreen() would otherwise silently
+ * treat as "not fullscreen". */
+static void log_window_wm_state(Display *dpy, Window win, const char *tag) {
+    Atom state_atom = XInternAtom(dpy, "_NET_WM_STATE", True);
+    if (state_atom == None) {
+        LOG_INFO("FLIP_TEST DEBUG POLL: %s win=0x%lx _NET_WM_STATE atom not interned on server", tag, win);
+        return;
+    }
+    Atom actual_type; int actual_format; unsigned long nitems, bytes_after;
+    unsigned char *prop = NULL;
+    int rc = XGetWindowProperty(dpy, win, state_atom, 0, 1024, False, XA_ATOM,
+                                 &actual_type, &actual_format, &nitems, &bytes_after, &prop);
+    if (rc != Success || !prop) {
+        LOG_INFO("FLIP_TEST DEBUG POLL: %s win=0x%lx _NET_WM_STATE query failed rc=%d", tag, win, rc);
+        return;
+    }
+    if (actual_type != XA_ATOM || actual_format != 32 || nitems == 0) {
+        LOG_INFO("FLIP_TEST DEBUG POLL: %s win=0x%lx _NET_WM_STATE present but empty/unexpected "
+                 "(type=%lu fmt=%d nitems=%lu)", tag, win, (unsigned long)actual_type, actual_format, nitems);
+        XFree(prop);
+        return;
+    }
+    Atom *atoms = (Atom *)prop;
+    char buf[512]; int off = 0;
+    for (unsigned long i = 0; i < nitems && off < (int)sizeof(buf) - 64; i++) {
+        char *name = XGetAtomName ? XGetAtomName(dpy, atoms[i]) : NULL;
+        int wrote = snprintf(buf + off, sizeof(buf) - off, "%s%s", i ? "," : "", name ? name : "?");
+        if (wrote > 0) off += wrote;
+        if (name) XFree(name);
+    }
+    LOG_INFO("FLIP_TEST DEBUG POLL: %s win=0x%lx _NET_WM_STATE(%lu)=[%s]", tag, win, nitems, buf);
     XFree(prop);
-    return found;
+}
+
+/* Walks the window's ancestor chain up to the root via XQueryTree, logging
+ * _NET_WM_STATE at each level. Some toolkits (SDL/GLFW in some setups, WM
+ * reparenting of decorated windows) put the Vulkan-surface window and the
+ * actual WM-managed top-level with EWMH state on it at different levels of
+ * this chain -- if is_wm_fullscreen() is reading the wrong one, this makes
+ * that visible directly instead of guessing. Runs once, not every poll
+ * iteration, to keep the log readable. */
+static void log_ancestor_wm_state_chain(Display *dpy, Window win) {
+    Window cur = win;
+    for (int depth = 0; depth < 16; depth++) {
+        char tag[32];
+        snprintf(tag, sizeof(tag), "ancestor depth=%d", depth);
+        log_window_wm_state(dpy, cur, tag);
+        XWindowAttributes attrs;
+        if (XGetWindowAttributes(dpy, cur, &attrs)) {
+            LOG_INFO("FLIP_TEST DEBUG POLL: %s win=0x%lx override_redirect=%d map_state=%d",
+                     tag, cur, attrs.override_redirect, attrs.map_state);
+        }
+        Window root, parent; Window *children = NULL; unsigned int nchildren = 0;
+        if (!XQueryTree(dpy, cur, &root, &parent, &children, &nchildren)) {
+            LOG_INFO("FLIP_TEST DEBUG POLL: XQueryTree failed at depth=%d win=0x%lx", depth, cur);
+            break;
+        }
+        if (children) XFree(children);
+        if (parent == 0 || parent == root) {
+            LOG_INFO("FLIP_TEST DEBUG POLL: reached root (win=0x%lx parent=0x%lx root=0x%lx) at depth=%d",
+                     cur, parent, root, depth);
+            break;
+        }
+        cur = parent;
+    }
+}
+
+/* Logs one size + wm_fullscreen sample, but ONLY when called -- unlike an
+ * earlier version of this diagnostic, there is deliberately no background
+ * thread here. A detached thread polling dpy/window for up to 10 real
+ * seconds independently of the app has no way to know when the app closes
+ * that Display (most apps don't call vkDestroySurfaceKHR on abrupt exit at
+ * all, so there's no reliable hook to stop it on) -- confirmed 2026-08-18,
+ * azahar: a SIGSEGV at process exit landed right where that thread would
+ * still have been mid-poll, almost certainly a use-after-free on the Xlib
+ * Display structure raced against the app's own shutdown. Safe alternative:
+ * only ever touch dpy/window from a thread the APP itself just called us
+ * on (GetPhysicalDeviceSurfaceCapabilitiesKHR, called from CreateSwapchainKHR
+ * and, on most engines, from the app's own per-frame resize-detection
+ * logic) -- by construction the app's Display is still alive at that
+ * instant, since the app itself is actively using it right then. */
+static void debug_log_fullscreen_sample(Surface *s) {
+    double debug_window_ms = 10000.0;
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+    double since_create_ms = (now.tv_sec - s->debug_create_time.tv_sec) * 1000.0 +
+                              (now.tv_nsec - s->debug_create_time.tv_nsec) / 1e6;
+    if (since_create_ms > debug_window_ms) return;
+    double since_last_ms = (now.tv_sec - s->debug_last_log_time.tv_sec) * 1000.0 +
+                            (now.tv_nsec - s->debug_last_log_time.tv_nsec) / 1e6;
+    if (since_last_ms < 200.0) return;
+    s->debug_last_log_time = now;
+    uint32_t w = 0, h = 0;
+    window_size(s, &w, &h);
+    bool fs = is_wm_fullscreen(s->dpy, s->window);
+    LOG_INFO("FLIP_TEST DEBUG POLL: t=%.0fms win=0x%lx size=%ux%u wm_fullscreen=%s",
+             since_create_ms, s->window, w, h, fs ? "true" : "false");
 }
 
 /* Figure out which /dev/tegra_dc_N drives the monitor `win` is actually on,
@@ -3093,6 +3238,9 @@ layer_CreateXlibSurfaceKHR(VkInstance instance,
     }
     *pSurface = (VkSurfaceKHR)(uintptr_t)s;
     LOG_INFO("CreateXlibSurfaceKHR -> surface=%p dpy=%p win=0x%lx", s, s->dpy, s->window);
+    clock_gettime(CLOCK_MONOTONIC, &s->debug_create_time);
+    s->debug_last_log_time = s->debug_create_time;
+    log_ancestor_wm_state_chain(s->dpy, s->window);
     return VK_SUCCESS;
 }
 
@@ -3134,6 +3282,9 @@ layer_CreateXcbSurfaceKHR(VkInstance instance,
     *pSurface = (VkSurfaceKHR)(uintptr_t)s;
     LOG_INFO("CreateXcbSurfaceKHR -> surface=%p dpy=%p (opened) win=0x%x",
              s, s->dpy, pCreateInfo->window);
+    clock_gettime(CLOCK_MONOTONIC, &s->debug_create_time);
+    s->debug_last_log_time = s->debug_create_time;
+    log_ancestor_wm_state_chain(s->dpy, s->window);
     return VK_SUCCESS;
 }
 
@@ -3188,6 +3339,7 @@ layer_GetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice physicalDevice,
         return in->d.GetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice, surface, pCaps);
     }
     uint32_t w = 0, h = 0; window_size(s, &w, &h);
+    debug_log_fullscreen_sample(s);
     pCaps->minImageCount = MIN_IMAGES;
     pCaps->maxImageCount = MAX_IMAGES;
     pCaps->currentExtent.width  = w ? w : 1;

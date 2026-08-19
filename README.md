@@ -1489,3 +1489,51 @@ runaway-recreation bug. `g_dead_swapchains`, `mark_swapchain_dead()`,
 `unmark_swapchain_dead()`, and the registry-based `is_dead_swapchain()`
 are gone; `is_dead_swapchain()` is back to a direct magic-value read on
 the (permanently allocated) struct itself.
+
+## Update 2026-08-18 part 6: is_wm_fullscreen() was checking the wrong
+window -- fixed for Qt apps (azahar/Citra)
+
+`is_wm_fullscreen()` (part of the WM-fullscreen gate added earlier this
+session, see the FULLSCREEN GATE comment in `layer_CreateSwapchainKHR`)
+only ever checked `_NET_WM_STATE` on the exact `Window` handed to
+`vkCreateXlibSurfaceKHR`. Confirmed via azahar (Citra fork, Qt-based) that
+this is wrong for some toolkits: `xwininfo -id <parent> -children` showed
+the Vulkan surface window is a plain rendering *child* of the actual
+WM-managed top-level ("Primary Window"), one level up in the X11 tree. Per
+EWMH, `_NET_WM_STATE` is only ever set on the WM-managed top-level, never
+on a rendering child, so the check returned false forever for this app --
+confirmed directly with `xprop -id` on the real top-level while the app
+was running: `_NET_WM_STATE_FULLSCREEN` was correctly set there, and had
+been for well over a second (not a timing race; two earlier theories --
+an override-redirect window bypassing the WM, and "this app just doesn't
+use EWMH fullscreen at all" -- were both directly disproved by checking
+`override_redirect` via `XGetWindowAttributes` and by `xprop`/`xwininfo`
+on the live process before landing on the real cause).
+
+Fixed by having `is_wm_fullscreen()` walk up to 8 ancestor levels via
+`XQueryTree`, checking `_NET_WM_STATE_FULLSCREEN` at each level, stopping
+at the root. Checks the window itself first (unchanged fast path for
+SDL2/GLFW apps like DDNet/gears that already set the atom directly on the
+surface window), only walking further for the cases that need it. The
+8-level cap is a generous, not precisely load-bearing, bound -- real-world
+reparenting WMs plus toolkit wrapper windows are observed at 1-3 levels;
+the walk only ever costs real X round trips up to wherever it actually
+finds the atom or hits the root, and this runs in `CreateSwapchainKHR`
+(resize/fullscreen-toggle events), never per-frame.
+
+Debugging this added two permanent-ish diagnostics, gated behind
+`VK_TEGRA_X11_PRESENT_LOG=2` like everything else at that level:
+`CreateXlibSurfaceKHR`/`CreateXcbSurfaceKHR` log the surface window's full
+ancestor chain (`_NET_WM_STATE` atom names, `override_redirect`,
+`map_state` at each level) once at creation, and
+`GetPhysicalDeviceSurfaceCapabilitiesKHR` logs a throttled (~200ms)
+size + `wm_fullscreen` sample for the first 10 seconds after surface
+creation. The first version of this second diagnostic used a dedicated
+background thread polling `dpy`/`window` independently of the app for up
+to 10 real seconds -- caused a SIGSEGV on azahar exit (a use-after-free
+race against the app closing its own `Display*`, which most apps don't
+signal to us via `vkDestroySurfaceKHR` on abrupt exit at all). Replaced
+with piggybacking on `GetPhysicalDeviceSurfaceCapabilitiesKHR`, which only
+ever runs on the app's own thread at a moment it's actively using its own
+`Display*` -- by construction it can't outlive the app's own X11 usage the
+way a detached thread could.
