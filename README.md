@@ -1432,3 +1432,60 @@ difference being whether SDL also does a video-mode switch, not the WM
 hint) -- zero real errors, only the expected harmless double-destroy
 warnings, clean shutdown on exit, user-confirmed working with no graphics
 error dialog.
+
+## Update 2026-08-18 part 5: reverted part 4 -- the registry caused a much
+worse bug than the leak it fixed
+
+Real-world use surfaced a severe regression from the registry fix above:
+toggling DDNet's fullscreen-mode setting went from a ~8 second transition
+(tombstone, part 3) to ~25 seconds with a visible black-screen pause
+(registry, part 4). First suspected the check ordering in
+`AcquireNextImageKHR`/`QueuePresentKHR`/`GetSwapchainImagesKHR`/
+`DestroySwapchainKHR` (`is_dead_swapchain()`'s registry lookup running
+before the cheap `as_swapchain()` check on every call) and reordered all
+four -- confirmed by direct user retest that this did **not** fix it
+("same issue").
+
+Added `clock_gettime`-based timing instrumentation to `CreateSwapchainKHR`/
+`DestroySwapchainKHR` and ran an apples-to-apples side-by-side comparison
+(same instrumentation on both the tombstone and registry builds, same
+reproduction steps):
+
+| | recreate cycles observed | total layer overhead |
+|---|---|---|
+| tombstone (4 toggles) | 7 | ~1.6s |
+| registry (5 toggles) | 248 (167 after startup) | ~39s |
+
+Not a per-call cost difference (average `CreateSwapchainKHR` cost was
+actually similar between the two, ~130-180ms either way, dominated by
+FBConfig/GLX/GOB-shader setup unrelated to dead-swapchain tracking). The
+registry version enters a **runaway recreate storm**: ~33 recreates per
+toggle instead of ~1-2. Root cause: `calloc()` deterministically hands
+back the exact same freed address for the next `Swapchain*` (confirmed in
+the log -- identical address every single cycle). Between
+`mark_swapchain_dead()` (end of the old swapchain's destroy) and the new
+swapchain's `calloc()` + `unmark_swapchain_dead()`, there's a wide window
+(~100ms+ of FBConfig/GLX/shader setup) during which a stale in-flight
+`Acquire`/`Present` call from DDNet's render thread -- still holding the
+old handle value from before the recreate -- can land *after* that exact
+address has already been reassigned to the new, live swapchain. Instead of
+getting a clean "dead handle" error, it silently aliases onto the new
+swapchain (`as_swapchain()` succeeds -- same address, valid magic),
+corrupting its state from a stale caller and most likely provoking DDNet
+to recreate yet again. Since the allocator keeps handing back the same
+address, this repeats every cycle instead of resolving.
+
+Tombstoning doesn't have this hazard: the struct is never freed, so an
+address is never reused, so a stale handle can never alias a different,
+live swapchain -- it can only ever read back its own permanent "dead"
+magic value, correctly and stably, every time.
+
+**Reverted to tombstoning (part 3) as the permanent fix.** The registry's
+whole reason for existing was avoiding the tombstone's per-destroyed-
+swapchain leak (`sizeof(Swapchain)` = 4400 bytes). Swapchains are only
+recreated on resize/fullscreen-toggle events, not per-frame, so that leak
+is a few KB per user action -- negligible next to a confirmed, severe
+runaway-recreation bug. `g_dead_swapchains`, `mark_swapchain_dead()`,
+`unmark_swapchain_dead()`, and the registry-based `is_dead_swapchain()`
+are gone; `is_dead_swapchain()` is back to a direct magic-value read on
+the (permanently allocated) struct itself.
