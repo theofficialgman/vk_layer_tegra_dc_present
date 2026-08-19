@@ -1324,3 +1324,71 @@ Confirmed fixed: `gears -f` now correctly bypasses FLIP4 (log:
 WSI"), fps is back to normal, and the close delay is gone -- both
 user-confirmed. Matches the user's own stated expectation going in: "I
 pretty much expect the layer to not be active when vsync isn't enabled."
+
+## Update 2026-08-18 part 3: Flatpak DDNet crash -- stale-handle-forwarded-to-ICD
+
+`flatpak run tw.ddnet.ddnet` (a Flatpak-sandboxed Vulkan game, DDraceNetwork)
+crashed (SIGSEGV) shortly after launch under this layer, but ran fine for
+10+ seconds with `VK_TEGRA_X11_PRESENT_DISABLE=1` -- confirming this
+layer's involvement was the trigger, not a pure app-side bug that would
+crash regardless.
+
+Debugging a Flatpak sandbox needed a different approach than every other
+app in this investigation: gdb attaching from the host (following forks
+across the `bwrap` sandbox boundary) failed to map shared library
+sections correctly once execution crossed into the sandbox's own mount
+namespace. `strace -f` also proved unreliable timing-wise (slowed
+execution enough to change behavior). What worked: `flatpak run --devel`,
+which swaps the app's `org.freedesktop.Platform` runtime for the matching
+`org.freedesktop.Sdk` (already installed, includes gdb) *inside* the
+sandbox -- then `--command=gdb ... --args /app/bin/DDNet` runs gdb
+natively inside the same mount namespace as the target, avoiding the
+cross-namespace symbol/fork issues entirely. A `-O2` build's backtrace
+initially looked like the crash was in a `VkSubmitInfo` full of garbage
+(a pointer into an X11 function, another into glibc malloc internals) --
+misleading debug-info imprecision under optimization; a `-O0 -g3` debug
+build (temporarily swapped into the Flatpak runtime's `nvidia_libs/`
+folder in place of the production build) gave a clean, trustworthy
+backtrace instead.
+
+**Root cause**: `layer_AcquireNextImageKHR` crashed at
+`if (!sc) return dev->d.AcquireNextImageKHR(...)` -- with `sc == NULL`
+and every other local showing genuine uninitialized-stack garbage (not
+misattributed this time; the `-O0` build confirmed it), meaning
+`as_swapchain()` correctly didn't recognize the handle as one of ours,
+and the fallback blindly forwarded it to the real ICD's
+`vkAcquireNextImageKHR` -- which then crashed deep inside
+`libnvidia-glcore.so.32.3.1`. The handle in question *used to be* one of
+our own `Swapchain*` structs: DDNet's own swapchain lifecycle logic
+double-destroys the same handle across its recreation flow (confirmed
+directly in the fixed build's logs -- see below), and something (almost
+certainly a separate render thread, given DDNet runs several) then calls
+`vkAcquireNextImageKHR` on the already-destroyed handle. Calling any
+Vulkan function on an already-destroyed swapchain is undefined behavior
+per spec -- a genuine race/bug in the app -- but `layer_DestroySwapchainKHR`
+previously `free()`'d the struct immediately, so by the time the stale
+Acquire arrived, `as_swapchain()` correctly said "not ours" (the freed
+memory no longer matched our magic number) and our layer naively treated
+that as "must be a genuine native handle, forward it" -- except it was
+*never* a real native handle in the first place (we don't create one for
+the FLIP4 path), so the ICD received a completely foreign pointer it had
+never allocated and crashed on it. This layer's swapchain-destroy timing
+(worker thread join, GLX context teardown, etc. -- all absent from native
+WSI's much lighter teardown) most likely widens the race window enough to
+make it reliably hit, where native WSI's faster teardown mostly doesn't.
+
+**Fix: never actually `free()` the `Swapchain` struct.**
+`layer_DestroySwapchainKHR` now zeroes it (as before) but then tombstones
+it with a second, distinct magic value (`SWAPCHAIN_MAGIC_DEAD`) instead of
+freeing it -- a small, permanent, one-time-per-swapchain memory leak
+(swapchains are created rarely: window resizes, fullscreen toggles, not
+per-frame) in exchange for `as_swapchain()`-adjacent entry points
+(`AcquireNextImageKHR`, `QueuePresentKHR`, `GetSwapchainImagesKHR`,
+`DestroySwapchainKHR` itself for double-destroy) being able to positively
+recognize "this handle used to be ours" via a new `is_dead_swapchain()`
+check, and return a proper Vulkan error (`VK_ERROR_OUT_OF_DATE_KHR`,
+spec-correct for "this swapchain is no longer usable") instead of
+forwarding a guaranteed-foreign pointer to the real ICD. Confirmed fixed
+end-to-end: the exact double-destroy race is now visible in the log as a
+handled warning ("already destroyed, ignoring double-destroy") instead of
+a crash, DDNet reaches its main menu and runs normally, user-confirmed.

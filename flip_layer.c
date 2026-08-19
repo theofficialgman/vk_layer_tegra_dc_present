@@ -1181,11 +1181,41 @@ typedef struct Swapchain {
 } Swapchain;
 
 #define SWAPCHAIN_MAGIC 0x5357415043484149ULL    /* "SWAPCHAI" — 8 bytes, fits uint64_t */
+/* Set on a Swapchain* by layer_DestroySwapchainKHR instead of freeing the
+ * struct -- see the comment there for why. Distinct from SWAPCHAIN_MAGIC so
+ * as_swapchain() (which only recognizes live swapchains) correctly treats
+ * a destroyed one as "not ours" for normal use, while is_dead_swapchain()
+ * can still specifically identify it as a handle that WAS ours. */
+#define SWAPCHAIN_MAGIC_DEAD 0x4445414444454144ULL /* "DEADDEAD" — 8 bytes, fits uint64_t */
 
 static Swapchain *as_swapchain(VkSwapchainKHR s) {
     Swapchain *p = (Swapchain *)(uintptr_t)s;
     if (!p || p->magic != SWAPCHAIN_MAGIC) return NULL;
     return p;
+}
+
+/* True if this handle used to be one of our own Swapchain* structs and has
+ * since been destroyed via layer_DestroySwapchainKHR. Entry points that
+ * fall through to the real ICD for handles as_swapchain() doesn't
+ * recognize (Acquire/Present/GetSwapchainImages/etc.) must check this
+ * FIRST and return a real Vulkan error instead -- a handle that was ours
+ * is NEVER a valid native ICD handle (we never created a real native
+ * swapchain for it in the first place), so forwarding it to the ICD hands
+ * it a completely foreign pointer the ICD has never seen and never
+ * allocated. Found 2026-08-18: the Flatpak DDNet client crashed
+ * (SIGSEGV deep inside libnvidia-glcore.so.32.3.1) doing exactly this --
+ * its own render thread called vkAcquireNextImageKHR on a swapchain
+ * another thread had already explicitly destroyed, a real race in that
+ * app (calling any Vulkan function on an already-destroyed swapchain is
+ * undefined behavior per spec), but our layer's forward-stale-handle-to-
+ * ICD behavior turned that race into a hard crash instead of a
+ * recoverable error -- confirmed absent without this layer (native WSI
+ * ran the same app for 10+ seconds with no crash), so our own handling is
+ * what needs to be more defensive here, independent of whether the app
+ * itself has a bug. */
+static bool is_dead_swapchain(VkSwapchainKHR s) {
+    Swapchain *p = (Swapchain *)(uintptr_t)s;
+    return p && p->magic == SWAPCHAIN_MAGIC_DEAD;
 }
 
 static void track_swapchain(Swapchain *sc);
@@ -3920,6 +3950,16 @@ layer_DestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain,
                            const VkAllocationCallbacks *pAlloc) {
     if (!swapchain) return;
     LOG_INFO("DestroySwapchainKHR: swapchain=%p", (void *)swapchain);
+    if (is_dead_swapchain(swapchain)) {
+        /* Double-destroy on a handle we already tombstoned -- also
+           undefined behavior per spec (like the stale-Acquire race this
+           tombstoning was added for, see is_dead_swapchain's comment),
+           but never forward it to the ICD: it was never a real native
+           handle in the first place. Log and stop here. */
+        LOG_WARN("DestroySwapchainKHR: swapchain=%p already destroyed, ignoring "
+                 "double-destroy", (void *)swapchain);
+        return;
+    }
     Swapchain *sc = as_swapchain(swapchain);
     DevNode *dev = dev_lookup(dispatch_key(device));
     if (!sc) { if (dev) dev->d.DestroySwapchainKHR(device, swapchain, pAlloc); return; }
@@ -3956,13 +3996,31 @@ layer_DestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain,
     pthread_cond_destroy(&sc->worker_cv_done);
     pthread_mutex_destroy(&sc->worker_lock);
     pthread_mutex_destroy(&sc->timing_lock);
+    /* Zero everything (defensive -- nothing should read any other field
+       from a dead handle, but stale pointers are one less thing to worry
+       about if something ever does), then tombstone rather than free().
+       Deliberately never freed: as_swapchain()/is_dead_swapchain() rely on
+       this exact address still being readable and still holding a magic
+       value for the entire remaining lifetime of the process, so that any
+       later call on this handle -- however it got here, whatever bug in
+       the app produced it -- is recognized as "used to be ours" and
+       rejected with a proper Vulkan error instead of being forwarded to
+       the real ICD as a foreign, unallocated handle it crashes on. See
+       is_dead_swapchain's comment (2026-08-18, Flatpak DDNet crash) for
+       the full story. Costs one small, permanent allocation per swapchain
+       ever created by an app using this layer -- swapchains are created
+       rarely enough (window resizes, fullscreen toggles) that this is a
+       reasonable trade for turning a hard crash into a graceful error. */
     memset(sc, 0, sizeof(*sc));
-    free(sc);
+    sc->magic = SWAPCHAIN_MAGIC_DEAD;
 }
 
 VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL
 layer_GetSwapchainImagesKHR(VkDevice device, VkSwapchainKHR swapchain,
                              uint32_t *pCount, VkImage *pImages) {
+    /* See is_dead_swapchain's comment: never forward a handle that used to
+       be ours to the real ICD, it's never a valid native handle. */
+    if (is_dead_swapchain(swapchain)) return VK_ERROR_OUT_OF_DATE_KHR;
     Swapchain *sc = as_swapchain(swapchain);
     if (!sc) {
         DevNode *dev = dev_lookup(dispatch_key(device));
@@ -4040,6 +4098,15 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL
 layer_AcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain,
                            uint64_t timeout, VkSemaphore semaphore, VkFence fence,
                            uint32_t *pIndex) {
+    /* See is_dead_swapchain's comment: this is the crash this whole
+       tombstoning scheme exists to prevent -- an app calling Acquire on a
+       swapchain it (or another of its own threads) already destroyed must
+       get a real Vulkan error here, never a blind forward of a handle
+       that was never a valid native one to begin with.
+       VK_ERROR_OUT_OF_DATE_KHR is the spec-correct "this swapchain is no
+       longer usable, recreate it" signal -- apps generally already handle
+       it, which may even let this self-recover instead of crashing. */
+    if (is_dead_swapchain(swapchain)) return VK_ERROR_OUT_OF_DATE_KHR;
     Swapchain *sc = as_swapchain(swapchain);
     DevNode *dev = dev_lookup(dispatch_key(device));
     if (!sc) return dev->d.AcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, pIndex);
@@ -4506,6 +4573,14 @@ layer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pInfo) {
     VkResult overall = VK_SUCCESS;
 
     for (uint32_t s = 0; s < pInfo->swapchainCount; s++) {
+        /* See is_dead_swapchain's comment: never forward a handle that
+           used to be ours to the real ICD. */
+        if (is_dead_swapchain(pInfo->pSwapchains[s])) {
+            VkResult r = VK_ERROR_OUT_OF_DATE_KHR;
+            if (pInfo->pResults) pInfo->pResults[s] = r;
+            if (overall == VK_SUCCESS) overall = r;
+            continue;
+        }
         Swapchain *sc = as_swapchain(pInfo->pSwapchains[s]);
         if (!sc) {
             /* Mixed batch — submit just this one through real WSI. */
