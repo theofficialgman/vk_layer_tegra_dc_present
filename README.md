@@ -1392,3 +1392,43 @@ forwarding a guaranteed-foreign pointer to the real ICD. Confirmed fixed
 end-to-end: the exact double-destroy race is now visible in the log as a
 handled warning ("already destroyed, ignoring double-destroy") instead of
 a crash, DDNet reaches its main menu and runs normally, user-confirmed.
+
+## Update 2026-08-18 part 4: refined the crash fix to avoid the struct leak
+
+Reasonable pushback on part 3's fix: tombstoning the `Swapchain` struct in
+place (never `free()`-ing it, just overwriting its magic value) leaks the
+*entire* multi-KB struct -- including its `PerImage images[MAX_IMAGES]`
+array -- once per swapchain ever destroyed, for the rest of the process's
+life.
+
+**Replaced with a small dedicated registry** (`g_dead_swapchains`, reusing
+the `bucket()`/`HASH_BUCKETS` hash-table pattern already used for
+`g_dev_table`/`g_inst_table`) that tracks only the destroyed pointer
+*value* in a ~16-byte node, while `layer_DestroySwapchainKHR` goes back to
+freeing the struct normally. `is_dead_swapchain()` now checks this
+registry instead of reading a magic value out of (necessarily still-alive)
+struct memory.
+
+This reopened a real, separate bug: since the struct *is* freed again, the
+exact same address gets handed back out by the allocator for the very
+next swapchain created -- confirmed directly in testing, a brand new,
+perfectly valid swapchain landed at the same address as one destroyed
+moments earlier, and the stale "dead" entry for that address was still in
+the registry. `GetSwapchainImagesKHR` on that new-but-flagged-dead
+swapchain returned `VK_ERROR_OUT_OF_DATE_KHR`, which DDNet's own error
+handling treated as fatal ("Could not get swap chain images", a visible
+error dialog -- not a crash, but a real regression from this specific
+fix). Fixed with `unmark_swapchain_dead()`, called right after every
+successful `calloc()` in `layer_CreateSwapchainKHR`: clears any stale
+registry entry for the freshly (re)used address before anything can query
+the new swapchain and get told it's dead.
+
+Confirmed fixed end-to-end with extended, more adversarial testing than
+the original repro: 128 swapchain recreations across the same session,
+including repeatedly toggling DDNet's "fullscreen" vs "desktop fullscreen"
+settings (both correctly detected as fullscreen and engaged FLIP4 --
+apparently SDL sets `_NET_WM_STATE_FULLSCREEN` for both on X11, the
+difference being whether SDL also does a video-mode switch, not the WM
+hint) -- zero real errors, only the expected harmless double-destroy
+warnings, clean shutdown on exit, user-confirmed working with no graphics
+error dialog.

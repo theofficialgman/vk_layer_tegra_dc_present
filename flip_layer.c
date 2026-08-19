@@ -1181,17 +1181,71 @@ typedef struct Swapchain {
 } Swapchain;
 
 #define SWAPCHAIN_MAGIC 0x5357415043484149ULL    /* "SWAPCHAI" — 8 bytes, fits uint64_t */
-/* Set on a Swapchain* by layer_DestroySwapchainKHR instead of freeing the
- * struct -- see the comment there for why. Distinct from SWAPCHAIN_MAGIC so
- * as_swapchain() (which only recognizes live swapchains) correctly treats
- * a destroyed one as "not ours" for normal use, while is_dead_swapchain()
- * can still specifically identify it as a handle that WAS ours. */
-#define SWAPCHAIN_MAGIC_DEAD 0x4445414444454144ULL /* "DEADDEAD" — 8 bytes, fits uint64_t */
 
 static Swapchain *as_swapchain(VkSwapchainKHR s) {
     Swapchain *p = (Swapchain *)(uintptr_t)s;
     if (!p || p->magic != SWAPCHAIN_MAGIC) return NULL;
     return p;
+}
+
+/* Registry of destroyed-swapchain pointer VALUES (not the structs
+ * themselves, which layer_DestroySwapchainKHR frees normally -- see
+ * is_dead_swapchain's comment for why this exists at all). Reuses the
+ * bucket()/HASH_BUCKETS hash table pattern already defined above for
+ * g_dev_table/g_inst_table, just with a minimal node (one pointer) instead
+ * of a full state struct: each destroyed swapchain costs one small,
+ * permanent heap allocation for the rest of the process's life (swapchains
+ * are destroyed rarely -- window resizes, fullscreen toggles, not
+ * per-frame -- so this is negligible even over a very long session),
+ * instead of leaking the entire multi-KB Swapchain struct the way an
+ * earlier version of this fix did by tombstoning the struct in place
+ * rather than freeing it. */
+typedef struct DeadSwapchainNode {
+    void *key;
+    struct DeadSwapchainNode *next;
+} DeadSwapchainNode;
+static DeadSwapchainNode *g_dead_swapchains[HASH_BUCKETS];
+static pthread_mutex_t g_dead_swapchains_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void mark_swapchain_dead(VkSwapchainKHR s) {
+    DeadSwapchainNode *n = malloc(sizeof(*n));
+    if (!n) return; /* best effort -- if malloc fails here the process is
+                        already in far worse trouble than a missed check */
+    n->key = (void *)(uintptr_t)s;
+    pthread_mutex_lock(&g_dead_swapchains_lock);
+    unsigned b = bucket(n->key);
+    n->next = g_dead_swapchains[b];
+    g_dead_swapchains[b] = n;
+    pthread_mutex_unlock(&g_dead_swapchains_lock);
+}
+
+/* Since the Swapchain struct itself IS freed normally (only its address
+ * gets remembered in the dead-swapchain registry, not the struct), the
+ * allocator can and does hand that exact address back out for the very
+ * next swapchain calloc'd -- confirmed 2026-08-18, Flatpak DDNet: a brand
+ * new, perfectly valid swapchain got allocated at the same address as one
+ * just destroyed moments earlier, and is_dead_swapchain() -- which only
+ * ever checks the raw pointer VALUE -- incorrectly flagged it dead,
+ * turning a working swapchain into a spurious VK_ERROR_OUT_OF_DATE_KHR
+ * (DDNet's own "Could not get swap chain images" fatal error). Called
+ * right after a successful calloc() in layer_CreateSwapchainKHR so a
+ * freshly (re)used address is never left with a stale "dead" entry from
+ * whatever used to live there. */
+static void unmark_swapchain_dead(VkSwapchainKHR s) {
+    void *key = (void *)(uintptr_t)s;
+    pthread_mutex_lock(&g_dead_swapchains_lock);
+    unsigned b = bucket(key);
+    DeadSwapchainNode **p = &g_dead_swapchains[b];
+    while (*p) {
+        if ((*p)->key == key) {
+            DeadSwapchainNode *dead = *p;
+            *p = dead->next;
+            free(dead);
+        } else {
+            p = &(*p)->next;
+        }
+    }
+    pthread_mutex_unlock(&g_dead_swapchains_lock);
 }
 
 /* True if this handle used to be one of our own Swapchain* structs and has
@@ -1214,8 +1268,13 @@ static Swapchain *as_swapchain(VkSwapchainKHR s) {
  * what needs to be more defensive here, independent of whether the app
  * itself has a bug. */
 static bool is_dead_swapchain(VkSwapchainKHR s) {
-    Swapchain *p = (Swapchain *)(uintptr_t)s;
-    return p && p->magic == SWAPCHAIN_MAGIC_DEAD;
+    void *key = (void *)(uintptr_t)s;
+    if (!key) return false;
+    pthread_mutex_lock(&g_dead_swapchains_lock);
+    DeadSwapchainNode *n = g_dead_swapchains[bucket(key)];
+    while (n && n->key != key) n = n->next;
+    pthread_mutex_unlock(&g_dead_swapchains_lock);
+    return n != NULL;
 }
 
 static void track_swapchain(Swapchain *sc);
@@ -3539,6 +3598,12 @@ layer_CreateSwapchainKHR(VkDevice device,
 
     Swapchain *sc = calloc(1, sizeof(*sc));
     if (!sc) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    /* See unmark_swapchain_dead's comment: this exact address may be a
+       reused allocation from a swapchain destroyed moments ago, which
+       would still be in the dead-swapchain registry. Clear it before
+       anything can query this (perfectly valid, brand new) swapchain and
+       get incorrectly told it's dead. */
+    unmark_swapchain_dead((VkSwapchainKHR)(uintptr_t)sc);
     sc->magic = SWAPCHAIN_MAGIC;
     sc->dev   = dev;
     sc->surf  = surf;
@@ -3996,23 +4061,16 @@ layer_DestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain,
     pthread_cond_destroy(&sc->worker_cv_done);
     pthread_mutex_destroy(&sc->worker_lock);
     pthread_mutex_destroy(&sc->timing_lock);
-    /* Zero everything (defensive -- nothing should read any other field
-       from a dead handle, but stale pointers are one less thing to worry
-       about if something ever does), then tombstone rather than free().
-       Deliberately never freed: as_swapchain()/is_dead_swapchain() rely on
-       this exact address still being readable and still holding a magic
-       value for the entire remaining lifetime of the process, so that any
-       later call on this handle -- however it got here, whatever bug in
-       the app produced it -- is recognized as "used to be ours" and
-       rejected with a proper Vulkan error instead of being forwarded to
-       the real ICD as a foreign, unallocated handle it crashes on. See
-       is_dead_swapchain's comment (2026-08-18, Flatpak DDNet crash) for
-       the full story. Costs one small, permanent allocation per swapchain
-       ever created by an app using this layer -- swapchains are created
-       rarely enough (window resizes, fullscreen toggles) that this is a
-       reasonable trade for turning a hard crash into a graceful error. */
+    /* Record the pointer VALUE in the dead-swapchain registry before
+       freeing -- see is_dead_swapchain's comment (2026-08-18, Flatpak
+       DDNet crash) for the full story. This is what lets a later call on
+       this exact handle -- however it got here, whatever bug in the app
+       produced it -- be recognized as "used to be ours" and rejected with
+       a proper Vulkan error, without needing to keep the (multi-KB)
+       struct itself alive just to read a tombstone value out of it. */
+    mark_swapchain_dead(swapchain);
     memset(sc, 0, sizeof(*sc));
-    sc->magic = SWAPCHAIN_MAGIC_DEAD;
+    free(sc);
 }
 
 VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL
@@ -4020,17 +4078,28 @@ layer_GetSwapchainImagesKHR(VkDevice device, VkSwapchainKHR swapchain,
                              uint32_t *pCount, VkImage *pImages) {
     /* See is_dead_swapchain's comment: never forward a handle that used to
        be ours to the real ICD, it's never a valid native handle. */
-    if (is_dead_swapchain(swapchain)) return VK_ERROR_OUT_OF_DATE_KHR;
+    if (is_dead_swapchain(swapchain)) {
+        LOG_INFO("GetSwapchainImagesKHR: swapchain=%p is dead, returning OUT_OF_DATE", (void*)swapchain);
+        return VK_ERROR_OUT_OF_DATE_KHR;
+    }
     Swapchain *sc = as_swapchain(swapchain);
     if (!sc) {
+        LOG_INFO("GetSwapchainImagesKHR: swapchain=%p not ours, forwarding to ICD", (void*)swapchain);
         DevNode *dev = dev_lookup(dispatch_key(device));
         return dev->d.GetSwapchainImagesKHR(device, swapchain, pCount, pImages);
     }
-    if (!pImages) { *pCount = sc->image_count; return VK_SUCCESS; }
+    if (!pImages) {
+        *pCount = sc->image_count;
+        LOG_INFO("GetSwapchainImagesKHR: swapchain=%p count query -> %u", (void*)swapchain, *pCount);
+        return VK_SUCCESS;
+    }
     uint32_t n = *pCount < sc->image_count ? *pCount : sc->image_count;
     for (uint32_t i = 0; i < n; i++) pImages[i] = sc->images[i].image;
+    VkResult r = n == sc->image_count ? VK_SUCCESS : VK_INCOMPLETE;
+    LOG_INFO("GetSwapchainImagesKHR: swapchain=%p data query in *pCount=%u sc->image_count=%u "
+             "-> wrote %u, ret=%d", (void*)swapchain, *pCount, sc->image_count, n, r);
     *pCount = n;
-    return n == sc->image_count ? VK_SUCCESS : VK_INCOMPLETE;
+    return r;
 }
 
 /* ----------------------------------------------------------------------- */
