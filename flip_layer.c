@@ -50,10 +50,8 @@
  *   2. At vkQueuePresentKHR time: bridges the application's render-done
  *      semaphore, hands the image index to a worker thread via a
  *      single-slot mailbox, and returns.
- *   3. The worker (GPU-side, no CPU readback) either vkCmdCopyImage's the
- *      rendered content into a separate LINEAR-tiled exportable image, or
- *      -- for tear-free output, see FLIP_TEST_GOB_REAL below -- dispatches
- *      a compute shader that converts it into the display controller's
+ *   3. The worker (GPU-side, no CPU readback) dispatches a compute shader
+ *      that converts the rendered content into the display controller's
  *      real block-linear (GOB) tiling layout in a raw exported buffer, then
  *      calls TEGRA_DC_EXT_FLIP4 with that buffer's dma-buf fd as buff_id.
  *   4. Bridges the worker's own completion back into a Vulkan semaphore so
@@ -157,16 +155,16 @@
  * correctly as it can be from userspace).
  *
  * Architecture: entirely pure Vulkan in the data path, no GL at all.
- * create_flip_export_image() makes a second, separate LINEAR-tiled,
- * exportable Vulkan image per swapchain image slot; the worker thread
- * vkCmdCopyImage's the app's real OPTIMAL-tiled rendered image into it
- * (GPU-side detile, no CPU readback) and hands its raw Vulkan-exported
- * dma-buf fd to FLIP4 directly as buff_id -- no nvmap involvement at all,
- * dma_buf_get() (what tegra_dc_ext_pin_window() actually calls to resolve
- * buff_id) works with any dma-buf fd regardless of which subsystem
- * exported it. tegra_dc_ext.h's ioctls are plain syscalls via
- * open()/ioctl(), no dlopen indirection needed the way GL/X11 need (see
- * RUNTIME LIBRARY LOADING below).
+ * create_gob_dest() exports a per-swapchain-image-slot buffer; the worker
+ * thread dispatches gob_swizzle.comp (see create_gob_pipeline) to convert
+ * the app's real OPTIMAL-tiled rendered image into that buffer in the
+ * display controller's real block-linear (GOB) tiling layout (GPU-side, no
+ * CPU readback) and hands its raw Vulkan-exported dma-buf fd to FLIP4
+ * directly as buff_id -- no nvmap involvement at all, dma_buf_get() (what
+ * tegra_dc_ext_pin_window() actually calls to resolve buff_id) works with
+ * any dma-buf fd regardless of which subsystem exported it. tegra_dc_ext.h's
+ * ioctls are plain syscalls via open()/ioctl(), no dlopen indirection needed
+ * the way GL/X11 need (see RUNTIME LIBRARY LOADING below).
  *
  * The one remaining non-Vulkan dependency: a minimal GLX context is kept
  * alive purely to call glXWaitVideoSyncSGI for vsync pacing, since FLIP4
@@ -180,7 +178,6 @@
 #define __user
 #include "tegra_dc_ext.h"
 #include "gob_swizzle_spv.h"
-#include "uapi/linux/nvhost_ioctl.h"
 #define FLIP_TEST_WIN_INDEX 1
 #define FLIP_TEST_NVSYNCPT_INVALID ((__u32)-1)
 /* ----------------------------------------------------------------------- */
@@ -589,10 +586,6 @@ typedef struct {
     PFN_vkAllocateMemory         AllocateMemory;
     PFN_vkFreeMemory             FreeMemory;
     PFN_vkBindImageMemory        BindImageMemory;
-    /* FLIP_TEST_GOB_PROBE: CPU-write a coordinate-revealing pattern
-     * directly into the LINEAR flip_image's memory. */
-    PFN_vkMapMemory              MapMemory;
-    PFN_vkUnmapMemory            UnmapMemory;
     PFN_vkCreateSemaphore        CreateSemaphore;
     PFN_vkDestroySemaphore       DestroySemaphore;
     PFN_vkCreateFence            CreateFence;
@@ -605,31 +598,21 @@ typedef struct {
     PFN_vkGetSemaphoreFdKHR      GetSemaphoreFdKHR;
     PFN_vkCmdPipelineBarrier     CmdPipelineBarrier;
     PFN_vkEndCommandBuffer       EndCommandBuffer;
-    /* FLIP_TEST: needed for the vkCmdCopyImage-based OPTIMAL->LINEAR
-     * detile, replacing the GL blit + glReadPixels path. */
+    /* Per-image command buffer used for the GOB compute dispatch. */
     PFN_vkCreateCommandPool      CreateCommandPool;
     PFN_vkDestroyCommandPool     DestroyCommandPool;
     PFN_vkAllocateCommandBuffers AllocateCommandBuffers;
     PFN_vkFreeCommandBuffers     FreeCommandBuffers;
     PFN_vkBeginCommandBuffer     BeginCommandBuffer;
-    PFN_vkCmdCopyImage           CmdCopyImage;
-    /* FLIP_TEST_SOLID_FILL: a solid, uniform color fill is invariant to any
-     * tiling/swizzle byte-permutation -- lets us test whether BLOCKLINEAR
-     * itself changes tearing behavior without needing to have cracked
-     * NVIDIA's real tiling layout first. */
-    PFN_vkCmdClearColorImage     CmdClearColorImage;
-    /* FLIP_TEST_BLOCKLINEAR + FLIP_TEST_SOLID_FILL: the buffer/memory
-     * aliasing fix -- see the flip_alias_buf comment on PerImage. */
+    /* The buffer side of the GOB compute-shader destination -- see
+     * create_gob_dest. */
     PFN_vkCreateBuffer              CreateBuffer;
     PFN_vkDestroyBuffer             DestroyBuffer;
     PFN_vkGetBufferMemoryRequirements GetBufferMemoryRequirements;
     PFN_vkBindBufferMemory          BindBufferMemory;
-    PFN_vkCmdFillBuffer             CmdFillBuffer;
-    PFN_vkGetImageSubresourceLayout GetImageSubresourceLayout;
-    /* FLIP_TEST GOB-swizzle compute pipeline: converts the app's rendered
-     * OPTIMAL image into a real block-linear byte buffer per-frame,
-     * combining the verified tear-free BLOCKLINEAR path with correct
-     * content instead of the uniform-fill proxy. */
+    /* GOB-swizzle compute pipeline: converts the app's rendered OPTIMAL
+     * image into a real block-linear byte buffer per-frame -- the
+     * confirmed tear-free, correct-content present path. */
     PFN_vkCreateShaderModule         CreateShaderModule;
     PFN_vkDestroyShaderModule        DestroyShaderModule;
     PFN_vkCreateDescriptorSetLayout  CreateDescriptorSetLayout;
@@ -886,46 +869,28 @@ typedef struct PerImage {
                                          real project this was copied from --
                                          no GL involved in signaling it here. */
 
-    /* The separate LINEAR-tiled, exportable image that `image` above gets
-     * vkCmdCopyImage'd into each frame (worker_thread_main) -- GPU-side
-     * detile, no CPU readback. See create_flip_export_image. Exported
-     * exactly once at swapchain creation; the same fd is reused as FLIP4's
-     * buff_id every frame -- dma_buf_get() (what tegra_dc_ext_pin_window()
-     * calls to resolve buff_id) takes the raw fd directly, no import step. */
-    VkImage          flip_image;
-    VkDeviceMemory   flip_memory;
-    int              flip_fd;
-    VkDeviceSize     flip_row_pitch;
-    VkDeviceSize     flip_offset;
+    /* Per-image command buffer + fence the worker reuses every frame for
+     * the GOB compute dispatch (worker_thread_main) that produces
+     * gob_dst_buf below. */
     VkCommandBuffer  flip_cmdbuf;
     VkFence          flip_fence;
-
-    /* FLIP_TEST_BLOCKLINEAR + FLIP_TEST_SOLID_FILL: a VkBuffer aliased over
-     * the exact same VkDeviceMemory as `image` (only when flip_blocklinear;
-     * requires that allocation to be non-dedicated -- see create_app_image).
-     * vkCmdFillBuffer operates on raw linear byte ranges, unlike
-     * vkCmdClearColorImage which is bounded by the image's logical texel
-     * addressing and provably cannot reach any tiling padding
-     * VK_IMAGE_TILING_OPTIMAL's opaque layout might reserve beyond that --
-     * exactly the gap that let stale memory bleed through in testing
-     * (2026-08-16). FillBuffer's whole-allocation raw write closes it. */
-    VkBuffer         flip_alias_buf;
-    uint64_t         flip_last_ns; /* diagnostic: wall-clock time of the last
-                                       FLIP4 using this slot's flip_image, to
+    uint64_t         flip_last_ns; /* diagnostic: wall-clock time this slot's
+                                       gob_dst_buf was last used by FLIP4, to
                                        measure real reuse spacing (see
                                        worker_thread_main). 0 = never used. */
 
-    /* FLIP_TEST_GOB_REAL: real per-frame content in the verified block-
-     * linear layout (README.md, "GOB block-linear formula", 2026-08-16).
-     * gob_dst_buf/gob_dst_mem/gob_dst_fd are the exported destination --
-     * what actually gets handed to FLIP4 as buff_id. gob_src_view is a
-     * view into `image` (the app's OPTIMAL-tiled render target) for the
-     * compute shader to imageLoad from. gob_dset is this slot's descriptor
-     * set (src view + dst buffer), allocated from Swapchain's shared
-     * gob_dpool. */
+    /* Real per-frame content in the verified block-linear layout
+     * (README.md, "GOB block-linear formula", 2026-08-16). gob_dst_buf/
+     * gob_dst_mem/gob_dst_fd are the exported destination -- what actually
+     * gets handed to FLIP4 as buff_id; gob_row_pitch is its win.stride
+     * (see create_gob_dest). gob_src_view is a view into `image` (the
+     * app's OPTIMAL-tiled render target) for the compute shader to
+     * imageLoad from. gob_dset is this slot's descriptor set (src view +
+     * dst buffer), allocated from Swapchain's shared gob_dpool. */
     VkBuffer         gob_dst_buf;
     VkDeviceMemory   gob_dst_mem;
     int              gob_dst_fd;
+    VkDeviceSize     gob_row_pitch;
     VkImageView      gob_src_view;
     VkDescriptorSet  gob_dset;
 
@@ -1101,87 +1066,11 @@ typedef struct Swapchain {
     uint32_t flip_out_w, flip_out_h; /* clamped to fit the screen, 1:1 */
     bool     flip_ready;
 
-    /* FLIP_TEST Option 1: kernel-side pre_syncpt_id wait. When enabled
-       (FLIP_TEST_KERNEL_WAIT=1), FLIP4 itself blocks inside the kernel's
-       deferred flip_worker on the DC's real vblank syncpoint before
-       latching the buffer, instead of the worker thread doing a userspace
-       glXWaitVideoSyncSGI wait beforehand. flip_nvhost_ctrl_fd is a handle
-       to /dev/nvhost-ctrl, used once per frame to read the syncpoint's
-       current value (NVHOST_IOCTL_CTRL_SYNCPT_READ) so we can compute the
-       "next vblank" target (current + 1) to hand to FLIP4 as pre_syncpt_val. */
-    bool     flip_kernel_wait;
-    int      flip_nvhost_ctrl_fd;
-    __u32    flip_vblank_syncpt_id;
-
-    /* FLIP_TEST Option 1b: fully GLX-free pacing. glXWaitVideoSyncSGI is a
-       software sleep woken by the scheduler, not an interrupt-precise
-       primitive -- FLIP_TEST_KERNEL_PACE=<N> replaces it with a genuinely
-       blocking wait on the DC's own hardware vblank syncpoint
-       (NVHOST_IOCTL_CTRL_SYNCPT_WAITEX on /dev/nvhost-ctrl, which -- unlike
-       FLIP4 -- really does block the calling thread until the real IRQ-
-       driven syncpoint reaches the target), removing GLX from the pacing
-       path entirely. N=1 paces to every vblank (~60fps); N=2 to every other
-       (~30fps), testing whether more margin changes tearing. When active,
-       FLIP4's own pre_syncpt_id is left at "invalid" -- submission is
-       already precisely timed by the wait, so gating the latch again would
-       just add another vblank of pure delay on top for no purpose. */
-    bool     flip_kernel_pace;
-    uint32_t flip_pace_divisor;
-    __u32    flip_pace_target;
-
-    /* FLIP_TEST_BLOCKLINEAR=1: kprobe capture of NVIDIA's own tear-free
-       fullscreen FLIP4 calls (2026-08-16) showed win->flags=0x20
-       (TEGRA_DC_EXT_FLIP_FLAG_BLOCKLINEAR) and block_height_log2=4 -- their
-       scanout buffer is GPU-native block-linear tiled, not pitch-linear.
-       Every earlier FLIP4 test in this prototype used a separate
-       VK_IMAGE_TILING_LINEAR detile target (create_flip_export_image),
-       which this hardware's DC may simply lack real atomic double-buffering
-       for. This mode skips that detile step entirely and exports the app's
-       own VK_IMAGE_TILING_OPTIMAL image directly (create_app_image adds
-       the export capability when this is set), flipping it with
-       TEGRA_DC_EXT_FLIP_FLAG_BLOCKLINEAR + block_height_log2=4 set to
-       match. See worker_thread_main and the FLIP4 windowattr construction. */
-    bool     flip_blocklinear;
-
-    /* FLIP_TEST_SOLID_FILL=1: replaces the app's actual rendered content
-       with our own alternating solid-color fill before FLIP4, on whichever
-       image is actually being flipped (pi->image if flip_blocklinear,
-       pi->flip_image otherwise). A uniform fill reads back correctly under
-       ANY tiling/swizzle permutation, since every byte in the buffer holds
-       the same value -- this isolates "does BLOCKLINEAR change tearing
-       behavior" from "did we get NVIDIA's exact tiling layout right",
-       which the visual corruption from FLIP_TEST_BLOCKLINEAR alone made
-       impossible to tell apart. Alternates a fully opaque red/blue full-
-       screen clear each present; a real tear shows as a split red/blue
-       frame, visible regardless of tiling. Works with or without
-       flip_blocklinear, for an apples-to-apples LINEAR vs BLOCKLINEAR
-       tearing comparison under identical (trivial) content. */
-    bool     flip_solid_fill;
-    uint32_t flip_solid_fill_counter;
-
-    /* FLIP_TEST_GOB_PROBE=<1|2>: empirically derive the DC's real
-       BLOCKLINEAR address permutation instead of guessing it. Uses the
-       known-good LINEAR flip_image path (CPU-mapped, HOST_VISIBLE|
-       HOST_COHERENT memory -- see create_flip_export_image), written once,
-       then flipped every frame while telling FLIP4 this LINEAR buffer is
-       BLOCKLINEAR (flags + block_height_log2, same knob as
-       flip_blocklinear). Mode 1: raw diagnostic pattern (coordinate-
-       revealing, no assumed swizzle) -- whatever shows up on screen
-       reveals the permutation empirically. Mode 2: writes a candidate
-       swizzle (gob_swizzle()) ourselves at write time, then displays a
-       plain (x,y) gradient -- if the candidate formula matches the DC's
-       real one, the BLOCKLINEAR-flagged read should show a CORRECT, clean
-       gradient (proof the formula works), not scrambled data. Mutually
-       exclusive with flip_blocklinear/flip_solid_fill in practice (uses
-       its own no-op content path in worker_thread_main). */
-    int      flip_gob_probe;
-
-    /* FLIP_TEST_GOB_REAL=1: renders real per-frame content through the
-     * verified GOB block-linear compute shader (gob_swizzle.comp) instead
-     * of the LINEAR detile copy or the uniform-fill causality proxy.
-     * Shared pipeline objects (one set for the whole swapchain); per-image
-     * descriptor sets/buffers live on PerImage (see its gob_* fields). */
-    bool                  flip_gob_real;
+    /* Renders real per-frame content through the verified GOB block-linear
+     * compute shader (gob_swizzle.comp) -- confirmed tear-free, correct
+     * content, the only present path this layer uses. Shared pipeline
+     * objects (one set for the whole swapchain); per-image descriptor
+     * sets/buffers live on PerImage (see its gob_* fields). */
     VkDescriptorSetLayout gob_dsl;
     VkPipelineLayout      gob_pipeline_layout;
     VkPipeline            gob_pipeline;
@@ -1486,153 +1375,45 @@ static void *worker_thread_main(void *arg) {
             cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             d->BeginCommandBuffer(pi->flip_cmdbuf, &cbbi);
 
-            if (sc->flip_gob_real) {
-                /* FLIP_TEST_GOB_REAL: dispatch gob_swizzle.comp to convert
-                   this frame's rendered content (pi->image, OPTIMAL) into
-                   the real block-linear layout (pi->gob_dst_buf). The
-                   app's own rendering already left pi->image in
-                   SHADER_READ_ONLY_OPTIMAL (per the layer's normal barrier
-                   rewriting); transition to GENERAL for the storage-image
-                   read, dispatch, transition back. */
-                VkImageMemoryBarrier to_general = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-                to_general.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-                to_general.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-                to_general.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-                to_general.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-                to_general.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                to_general.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                to_general.image = pi->image;
-                to_general.subresourceRange = (VkImageSubresourceRange){ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-                d->CmdPipelineBarrier(pi->flip_cmdbuf, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &to_general);
+            /* Dispatch gob_swizzle.comp to convert this frame's rendered
+               content (pi->image, OPTIMAL) into the real block-linear
+               layout (pi->gob_dst_buf). The app's own rendering already
+               left pi->image in SHADER_READ_ONLY_OPTIMAL (per the layer's
+               normal barrier rewriting); transition to GENERAL for the
+               storage-image read, dispatch, transition back. */
+            VkImageMemoryBarrier to_general = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+            to_general.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            to_general.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            to_general.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            to_general.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            to_general.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            to_general.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            to_general.image = pi->image;
+            to_general.subresourceRange = (VkImageSubresourceRange){ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            d->CmdPipelineBarrier(pi->flip_cmdbuf, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &to_general);
 
-                d->CmdBindPipeline(pi->flip_cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, sc->gob_pipeline);
-                d->CmdBindDescriptorSets(pi->flip_cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                         sc->gob_pipeline_layout, 0, 1, &pi->gob_dset, 0, NULL);
-                uint32_t pc[4] = {
-                    sc->extent.width, sc->extent.height,
-                    (uint32_t)sc->gob_block_height_log2,
-                    (sc->extent.width * 4 + 63) / 64, /* round up -- must match
-                        create_gob_dest's gobs_wide and pi->flip_row_pitch */
-                };
-                d->CmdPushConstants(pi->flip_cmdbuf, sc->gob_pipeline_layout,
-                                    VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
-                d->CmdDispatch(pi->flip_cmdbuf,
-                               (sc->extent.width + 15) / 16, (sc->extent.height + 7) / 8, 1);
+            d->CmdBindPipeline(pi->flip_cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, sc->gob_pipeline);
+            d->CmdBindDescriptorSets(pi->flip_cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                     sc->gob_pipeline_layout, 0, 1, &pi->gob_dset, 0, NULL);
+            uint32_t pc[4] = {
+                sc->extent.width, sc->extent.height,
+                (uint32_t)sc->gob_block_height_log2,
+                (sc->extent.width * 4 + 63) / 64, /* round up -- must match
+                    create_gob_dest's gobs_wide */
+            };
+            d->CmdPushConstants(pi->flip_cmdbuf, sc->gob_pipeline_layout,
+                                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+            d->CmdDispatch(pi->flip_cmdbuf,
+                           (sc->extent.width + 15) / 16, (sc->extent.height + 7) / 8, 1);
 
-                VkImageMemoryBarrier to_shader = to_general;
-                to_shader.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-                to_shader.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-                to_shader.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-                to_shader.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-                d->CmdPipelineBarrier(pi->flip_cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &to_shader);
-            } else if (sc->flip_solid_fill) {
-                /* FLIP_TEST_SOLID_FILL: overwrite whichever image actually
-                   gets flipped with a full-screen solid color, alternating
-                   each present, ignoring the app's real content entirely.
-                   A uniform fill reads back correctly under ANY tiling/
-                   swizzle permutation, so this tests tearing itself --
-                   independent of flip_blocklinear's tiling-correctness
-                   problem. Toggle only once every N frames (default 20,
-                   ~0.33s at 60fps) instead of every frame -- an every-frame
-                   toggle is too fast to consciously register as anything
-                   but flicker, which was the exact problem reported
-                   watching it live. FLIP_TEST_SOLID_FILL_PERIOD overrides. */
-                static long period = -1;
-                if (period < 0) {
-                    const char *e = getenv("FLIP_TEST_SOLID_FILL_PERIOD");
-                    period = e ? atol(e) : 20;
-                    if (period < 1) period = 1;
-                    LOG_INFO("FLIP_TEST: solid fill toggles every %ld frames", period);
-                }
-                uint32_t parity = (sc->flip_solid_fill_counter++ / (uint32_t)period) & 1;
-
-                if (sc->flip_blocklinear) {
-                    /* Raw byte-level fill via flip_alias_buf, aliased over
-                       the exact same memory as pi->image (see its comment
-                       on PerImage) -- reaches every physical byte of the
-                       allocation, including any tiling padding
-                       vkCmdClearColorImage provably cannot touch (that gap
-                       is what let stale memory bleed through when this
-                       used ClearColorImage on pi->image directly, tested
-                       2026-08-16). No barriers needed: nothing else touches
-                       this memory earlier in this same command buffer, and
-                       the only consumer is the DC (external to Vulkan),
-                       already ordered via the fence + FLIP4 ioctl below. */
-                    uint32_t pattern = parity ? 0xFF0000FFu /* blue-ish, byte order irrelevant here */
-                                               : 0xFFFF0000u /* red-ish */;
-                    d->CmdFillBuffer(pi->flip_cmdbuf, pi->flip_alias_buf, 0, VK_WHOLE_SIZE, pattern);
-                } else {
-                    /* LINEAR path: already tested clean with a plain
-                       vkCmdClearColorImage (no bleed-through observed), so
-                       no need for the buffer-alias approach here. */
-                    VkImageMemoryBarrier to_dst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-                    to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                    to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-                    to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                    to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                    to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                    to_dst.image = pi->flip_image;
-                    to_dst.subresourceRange = (VkImageSubresourceRange){ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-                    d->CmdPipelineBarrier(pi->flip_cmdbuf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &to_dst);
-
-                    VkClearColorValue color = parity
-                        ? (VkClearColorValue){{ 0.0f, 0.0f, 1.0f, 1.0f }}   /* blue */
-                        : (VkClearColorValue){{ 1.0f, 0.0f, 0.0f, 1.0f }};  /* red */
-                    d->CmdClearColorImage(pi->flip_cmdbuf, pi->flip_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                          &color, 1, &to_dst.subresourceRange);
-
-                    VkImageMemoryBarrier to_general = to_dst;
-                    to_general.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                    to_general.dstAccessMask = 0;
-                    to_general.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                    to_general.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-                    d->CmdPipelineBarrier(pi->flip_cmdbuf, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                          VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 1, &to_general);
-                }
-            } else if (sc->flip_gob_probe) {
-                /* FLIP_TEST_GOB_PROBE: pi->flip_image was written once with
-                   the test pattern in create_flip_export_image and must
-                   stay untouched -- nothing to record here, same reasoning
-                   as the flip_blocklinear no-op case below. */
-            } else if (!sc->flip_blocklinear) {
-                /* FLIP_TEST_BLOCKLINEAR without solid fill: pi->image itself
-                   is what gets flipped (exported directly by
-                   create_app_image) -- no detile copy needed, nothing to
-                   record here. The empty command buffer is still submitted
-                   below purely for its wait/signal/fence timing, identical
-                   to the non-blocklinear path. */
-                VkImageMemoryBarrier to_src = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-                to_src.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-                to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-                to_src.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-                to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-                to_src.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                to_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                to_src.image = pi->image;
-                to_src.subresourceRange = (VkImageSubresourceRange){ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-                d->CmdPipelineBarrier(pi->flip_cmdbuf, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                                      VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &to_src);
-
-                VkImageCopy region = {0};
-                region.srcSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-                region.dstSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-                region.extent = (VkExtent3D){ sc->extent.width, sc->extent.height, 1 };
-                d->CmdCopyImage(pi->flip_cmdbuf,
-                                pi->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                pi->flip_image, VK_IMAGE_LAYOUT_GENERAL,
-                                1, &region);
-
-                VkImageMemoryBarrier to_shader = to_src;
-                to_shader.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-                to_shader.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-                to_shader.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-                to_shader.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-                d->CmdPipelineBarrier(pi->flip_cmdbuf, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &to_shader);
-            }
+            VkImageMemoryBarrier to_shader = to_general;
+            to_shader.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            to_shader.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            to_shader.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            to_shader.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            d->CmdPipelineBarrier(pi->flip_cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &to_shader);
 
             d->EndCommandBuffer(pi->flip_cmdbuf);
 
@@ -1659,9 +1440,6 @@ static void *worker_thread_main(void *arg) {
                 LOG_WARN("FLIP_TEST: copy QueueSubmit failed: %d", sr);
             }
 
-            __u32 kernel_wait_syncpt_val = 0;
-            bool  kernel_wait_ok = false;
-
             /* Wait for vblank AFTER FLIP4, not before -- default as of
                2026-08-18. FLIP4 is called the instant content is ready
                instead of being gated behind a full extra vblank wait
@@ -1681,10 +1459,7 @@ static void *worker_thread_main(void *arg) {
                conservative before-FLIP4 ordering if tearing reappears
                (different driver, heavier scene, system load, etc. could
                all shrink the deferred kernel worker's margin before the
-               next vblank). Declared here, above the kernel_pace/GLX-wait
-               branch below, so both the skip-if-set check inside that
-               branch and the do-it-here check after the FLIP4 call
-               further down can see it. */
+               next vblank). */
             static int wait_after_flip = -1;
             if (wait_after_flip < 0) {
                 const char *e = getenv("FLIP_TEST_WAIT_AFTER_FLIP");
@@ -1694,155 +1469,29 @@ static void *worker_thread_main(void *arg) {
                                           : "before FLIP4 (FLIP_TEST_WAIT_AFTER_FLIP=0, more conservative)");
             }
 
-            if (sc->flip_kernel_pace) {
-                /* FLIP_TEST Option 1b: fully GLX-free pacing. Unlike FLIP4,
-                 * this ioctl really does block the calling thread --
-                 * nvhost_ioctl_ctrl_syncpt_waitex() (host1x.c) calls
-                 * nvhost_syncpt_wait_timeout() synchronously and returns
-                 * only once the real IRQ-driven syncpoint reaches
-                 * flip_pace_target (or the timeout below elapses). No SGI,
-                 * no software sleep -- the wakeup is the same hardware
-                 * event that increments the syncpoint. 1000ms timeout is
-                 * just a safety backstop (normal case: every ~16.6ms); a
-                 * timeout here would mean vblank interrupts themselves
-                 * stopped, which the log makes visible instead of hanging
-                 * forever. */
-                struct nvhost_ctrl_syncpt_waitex_args wa = {0};
-                wa.id = sc->flip_vblank_syncpt_id;
-                wa.thresh = sc->flip_pace_target;
-                wa.timeout = 1000;
-                struct timespec _wa_t0; clock_gettime(CLOCK_MONOTONIC, &_wa_t0);
-                int wr = ioctl(sc->flip_nvhost_ctrl_fd, NVHOST_IOCTL_CTRL_SYNCPT_WAITEX, &wa);
-                struct timespec _wa_t1; clock_gettime(CLOCK_MONOTONIC, &_wa_t1);
-                static int _wa_log_count = 0;
-                if (_wa_log_count < 600) {
-                    double _wa_ms = (_wa_t1.tv_sec - _wa_t0.tv_sec) * 1000.0 +
-                                     (_wa_t1.tv_nsec - _wa_t0.tv_nsec) / 1e6;
-                    LOG_INFO("FLIP_TEST: WAITEX target=%u ret=%d value=%u took=%.3fms",
-                             wa.thresh, wr, wa.value, _wa_ms);
-                    _wa_log_count++;
-                }
-                if (wr < 0) {
-                    LOG_WARN("FLIP_TEST: SYNCPT_WAITEX failed: %m -- resyncing target");
-                    struct nvhost_ctrl_syncpt_read_args rd = { .id = sc->flip_vblank_syncpt_id };
-                    if (ioctl(sc->flip_nvhost_ctrl_fd, NVHOST_IOCTL_CTRL_SYNCPT_READ, &rd) == 0)
-                        sc->flip_pace_target = rd.value + sc->flip_pace_divisor;
-                } else {
-                    sc->flip_pace_target += sc->flip_pace_divisor;
-                }
-                /* Submission is already precisely timed by the wait above;
-                 * FLIP4's own pre_syncpt_id stays invalid (kernel_wait_ok
-                 * stays false) -- gating the latch again would just add
-                 * another vblank of pure delay on top for no purpose. */
-            } else {
-                /* FLIP_TEST_WAIT_AFTER_FLIP=0 (opt-out from the 2026-08-18
-                 * default -- see the wait_after_flip comment above): wait
-                 * for vblank HERE, right before FLIP4, instead of after.
-                 * Gives the driver maximum lead time before the *next*
-                 * vblank to latch the new buffer, instead of calling
-                 * FLIP4 at an arbitrary phase (whenever the copy above
-                 * happened to finish) and only pacing the *next* loop
-                 * iteration. This ordering was the default until
-                 * 2026-08-18: an earlier driver produced a tear
-                 * consistently mid-frame instead of at the top with the
-                 * after-FLIP4 ordering -- exactly the signature of
-                 * flipping at a fixed but not-vblank-aligned offset into
-                 * each frame interval -- which is why this wait moved
-                 * here in the first place. Re-test with
-                 * FLIP_TEST_WAIT_AFTER_FLIP=0 if the current default
-                 * starts tearing on some driver/scene/load combination.
-                 *
-                 * FLIP_TEST Option 1 (flip_kernel_wait) does NOT remove
-                 * this wait -- source-verified (dev.c: tegra_dc_ext_flip())
-                 * that TEGRA_DC_EXT_FLIP4 calls kthread_queue_work() and
-                 * returns immediately; the pre_syncpt_id/pre_syncpt_val
-                 * wait lives inside tegra_dc_ext_flip_worker, a DEFERRED
-                 * kthread that runs asynchronously after the ioctl already
-                 * returned. It cannot provide backpressure to this thread
-                 * -- an earlier attempt to skip this wait under
-                 * flip_kernel_wait let FLIP4 calls run unthrottled
-                 * (~238fps observed via the reuse-gap diagnostic), which
-                 * also risks a genuine buffer-reuse race: only 3
-                 * flip_image slots exist, and overwriting one via
-                 * vkCmdCopyImage faster than the real ~16.6ms vblank
-                 * period can race a still-pending kernel-queued flip
-                 * targeting that same dma-buf. So this wait stays
-                 * unconditional; Option 1 only adds a second, hardware-
-                 * precise gate on top (below), testing latch precision,
-                 * not replacing pacing. */
-                if (!wait_after_flip &&
-                    sc->glXWaitVideoSyncSGI && sc->present_mode != VK_PRESENT_MODE_IMMEDIATE_KHR) {
-                    unsigned int count = 0;
-                    if (sc->glXGetVideoSyncSGI(&count) == 0)
-                        sc->glXWaitVideoSyncSGI(2, (count + 1) & 1, &count);
-                    else
-                        sc->glXWaitVideoSyncSGI(2, 0, &count);
-                }
-
-                /* FLIP_TEST: manual timing knob. We don't actually know
-                 * whether glXWaitVideoSyncSGI's return lands exactly at
-                 * the hardware vblank edge or some measurable amount
-                 * before/after it -- sweeping a small extra delay here
-                 * lets us find out empirically by watching where the tear
-                 * moves, rather than guessing. FLIP_TEST_DELAY_US=
-                 * <microseconds>, read once and cached (not worth a
-                 * getenv() every frame). */
-                {
-                    static long delay_us = -1;
-                    if (delay_us < 0) {
-                        const char *e = getenv("FLIP_TEST_DELAY_US");
-                        delay_us = e ? atol(e) : 0;
-                        LOG_INFO("FLIP_TEST: extra pre-FLIP4 delay = %ld us", delay_us);
-                    }
-                    if (delay_us > 0) usleep((useconds_t)delay_us);
-                }
-
-                /* FLIP_TEST Option 1: on top of the userspace SGI wait
-                 * above (which paces us to ~vblank rate but sleeps in
-                 * software, not a hardware-interrupt-precise primitive),
-                 * also resolve "next vblank" as (current syncpt value + 1)
-                 * and hand it to FLIP4 as pre_syncpt_id/pre_syncpt_val.
-                 * tegra_dc_ext_flip_worker (dev.c) checks
-                 * (s32)pre_syncpt_id >= 0 and, if so, calls
-                 * nvhost_syncpt_wait_timeout_ext() to block itself --
-                 * inside the kernel, gated on the real hardware syncpoint
-                 * -- on that exact value before applying the window
-                 * attributes. This is an absolute-value wait, no
-                 * divisor/remainder semantics like glXWaitVideoSyncSGI.
-                 * The vblank syncpoint auto-increments once per hardware
-                 * vblank regardless of flips (confirmed via
-                 * syncpt_probe.c: exactly 6 increments per 100ms = 60Hz),
-                 * independent of software wakeup jitter -- this tests
-                 * whether that hardware-precise final gate changes tear
-                 * behavior versus the already-tested pure-SGI-wait
-                 * baseline. */
-                if (sc->flip_kernel_wait) {
-                    /* Proof-of-execution knob: FLIP_TEST_SYNCPT_OFFSET
-                     * overrides the "+1" delta below. Set to something
-                     * unreachable within the kernel's hardcoded 5000ms
-                     * nvhost_syncpt_wait_timeout_ext timeout (dev.c does
-                     * not check its return value, so it always falls
-                     * through and applies the flip afterward) -- e.g. 300
-                     * (~5s at 60Hz) -- to get a distinctive, falsifiable
-                     * ~5-second-per-frame visual freeze. That exact stall
-                     * duration can only come from that kernel code path
-                     * actually executing and blocking; nothing in
-                     * userspace times out at 5000ms. Default 1 = normal
-                     * "next vblank" behavior. */
-                    static long offset = -1;
-                    if (offset < 0) {
-                        const char *e = getenv("FLIP_TEST_SYNCPT_OFFSET");
-                        offset = e ? atol(e) : 1;
-                        LOG_INFO("FLIP_TEST: kernel wait syncpt offset = +%ld", offset);
-                    }
-                    struct nvhost_ctrl_syncpt_read_args rd = { .id = sc->flip_vblank_syncpt_id };
-                    if (ioctl(sc->flip_nvhost_ctrl_fd, NVHOST_IOCTL_CTRL_SYNCPT_READ, &rd) == 0) {
-                        kernel_wait_syncpt_val = rd.value + (__u32)offset;
-                        kernel_wait_ok = true;
-                    } else {
-                        LOG_WARN("FLIP_TEST: SYNCPT_READ failed: %m");
-                    }
-                }
+            /* FLIP_TEST_WAIT_AFTER_FLIP=0 (opt-out from the 2026-08-18
+             * default -- see the wait_after_flip comment above): wait
+             * for vblank HERE, right before FLIP4, instead of after.
+             * Gives the driver maximum lead time before the *next*
+             * vblank to latch the new buffer, instead of calling
+             * FLIP4 at an arbitrary phase (whenever the copy above
+             * happened to finish) and only pacing the *next* loop
+             * iteration. This ordering was the default until
+             * 2026-08-18: an earlier driver produced a tear
+             * consistently mid-frame instead of at the top with the
+             * after-FLIP4 ordering -- exactly the signature of
+             * flipping at a fixed but not-vblank-aligned offset into
+             * each frame interval -- which is why this wait moved
+             * here in the first place. Re-test with
+             * FLIP_TEST_WAIT_AFTER_FLIP=0 if the current default
+             * starts tearing on some driver/scene/load combination. */
+            if (!wait_after_flip &&
+                sc->glXWaitVideoSyncSGI && sc->present_mode != VK_PRESENT_MODE_IMMEDIATE_KHR) {
+                unsigned int count = 0;
+                if (sc->glXGetVideoSyncSGI(&count) == 0)
+                    sc->glXWaitVideoSyncSGI(2, (count + 1) & 1, &count);
+                else
+                    sc->glXWaitVideoSyncSGI(2, 0, &count);
             }
 
             struct tegra_dc_ext_flip_windowattr win = {0};
@@ -1853,11 +1502,11 @@ static void *worker_thread_main(void *arg) {
              * the raw Vulkan-exported fd; no nvmap import step needed at
              * all, dma_buf_get() works with any dma-buf regardless of
              * which subsystem exported it. */
-            win.buff_id = (__u32)(sc->flip_gob_real ? pi->gob_dst_fd : pi->flip_fd);
+            win.buff_id = (__u32)pi->gob_dst_fd;
             win.blend = TEGRA_DC_EXT_BLEND_NONE;
-            win.offset = (__u32)pi->flip_offset;
-            win.stride = (__u32)pi->flip_row_pitch; /* actual Vulkan-reported
-                pitch, may include padding -- don't assume width*4. */
+            win.offset = 0;
+            win.stride = (__u32)pi->gob_row_pitch; /* rounded-up GOB row
+                pitch -- see create_gob_dest's gobs_wide comment. */
             win.pixformat = TEGRA_DC_EXT_FMT_T_A8R8G8B8;
             win.w = sc->flip_out_w << 12;
             win.h = sc->flip_out_h << 12;
@@ -1884,39 +1533,20 @@ static void *worker_thread_main(void *arg) {
                                         assignment is likely a harmless no-op
                                         either way, not the real opacity
                                         mechanism. Left as-is; unrelated to
-                                        the blocklinear retest below. */
-            if (sc->flip_blocklinear || sc->flip_gob_probe || sc->flip_gob_real) {
-                /* flags=0x20 + swap_interval=1 match NVIDIA's own captured
-                   values exactly (kprobe on tegra_dc_ext_flip(),
-                   2026-08-16, fullscreen glxgears, tear-free). block_height_
-                   log2 visually produced tiling-scramble at the captured
-                   value of 4 -- VK_IMAGE_TILING_OPTIMAL's actual physical
-                   layout is implementation-opaque and isn't guaranteed to
-                   be the same block-linear variant the DC expects, so the
-                   right value (if any single value works at all) has to be
-                   found empirically. FLIP_TEST_BLOCKHEIGHT_LOG2=<0-5>
-                   overrides it per run without a rebuild. Under
-                   flip_gob_probe, this same flag/value combo is applied to
-                   the known-good LINEAR flip_image on purpose -- that's the
-                   whole point of the probe. */
-                static long bhl2 = -1;
-                if (bhl2 < 0) {
-                    const char *e = getenv("FLIP_TEST_BLOCKHEIGHT_LOG2");
-                    bhl2 = e ? atol(e) : 4;
-                    LOG_INFO("FLIP_TEST: blocklinear block_height_log2 = %ld", bhl2);
-                }
-                win.flags |= TEGRA_DC_EXT_FLIP_FLAG_BLOCKLINEAR;
-                win.block_height_log2 = (__u8)bhl2;
-                win.swap_interval = 1;
-            }
-            if (kernel_wait_ok) {
-                win.pre_syncpt_id  = sc->flip_vblank_syncpt_id;
-                win.pre_syncpt_val = kernel_wait_syncpt_val;
-            } else {
-                win.pre_syncpt_id = FLIP_TEST_NVSYNCPT_INVALID; /* (s32)0 >= 0
-                    would make the driver wait on syncpoint 0, which is
-                    invalid -- spams dmesg and never signals. */
-            }
+                                        the blocklinear flags below. */
+            /* flags=0x20 + swap_interval=1 match NVIDIA's own captured
+               values exactly (kprobe on tegra_dc_ext_flip(), 2026-08-16,
+               fullscreen glxgears, tear-free) -- required for the DC to
+               interpret gob_dst_buf's content as block-linear rather than
+               pitch-linear. block_height_log2 is sc->gob_block_height_log2,
+               cached from FLIP_TEST_BLOCKHEIGHT_LOG2 at swapchain creation
+               (same value the gob_swizzle.comp dispatch above used). */
+            win.flags |= TEGRA_DC_EXT_FLIP_FLAG_BLOCKLINEAR;
+            win.block_height_log2 = (__u8)sc->gob_block_height_log2;
+            win.swap_interval = 1;
+            win.pre_syncpt_id = FLIP_TEST_NVSYNCPT_INVALID; /* (s32)0 >= 0
+                would make the driver wait on syncpoint 0, which is
+                invalid -- spams dmesg and never signals. */
 
             struct tegra_dc_ext_flip_4 flip = {0};
             flip.win = (__u64)(uintptr_t)&win;
@@ -2054,7 +1684,6 @@ static void *worker_thread_main(void *arg) {
         ioctl(sc->flip_dc_fd, TEGRA_DC_EXT_FLIP4, &flip);
         if (flip.post_syncpt_fd >= 0) close(flip.post_syncpt_fd); /* see the per-frame call's comment */
     }
-    if (sc->flip_nvhost_ctrl_fd >= 0) close(sc->flip_nvhost_ctrl_fd);
     if (sc->flip_dc_fd >= 0) close(sc->flip_dc_fd);
 
     glXMakeCurrent(sc->worker_dpy, None, NULL);
@@ -2180,20 +1809,12 @@ static int find_memtype(const VkPhysicalDeviceMemoryProperties *p, uint32_t bits
 
 /* Creates the app-facing OPTIMAL-tiled image the app renders into. Not
  * externally exported -- nothing needs to import it cross-API or
- * cross-process; the FLIP_TEST copy step (worker_thread_main) reads it
- * directly within the same VkDevice via vkCmdCopyImage. */
+ * cross-process; the GOB compute shader (worker_thread_main) reads it
+ * directly within the same VkDevice via an imageLoad. */
 static VkResult create_app_image(DevNode *dev, Swapchain *sc, PerImage *pi) {
     DeviceDispatch *d = &dev->d;
-    pi->flip_fd = -1;
-
-    /* FLIP_TEST_BLOCKLINEAR: export this OPTIMAL-tiled image directly
-       (OPAQUE_FD) instead of the separate LINEAR detile target -- see the
-       flip_blocklinear comment on the Swapchain struct. */
-    VkExternalMemoryImageCreateInfo emi = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };
-    emi.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
 
     VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-    if (sc->flip_blocklinear) ici.pNext = &emi;
     ici.imageType = VK_IMAGE_TYPE_2D;
     ici.format = sc->format;
     ici.extent.width = sc->extent.width;
@@ -2229,8 +1850,8 @@ static VkResult create_app_image(DevNode *dev, Swapchain *sc, PerImage *pi) {
     ici.usage = sc->image_usage
               | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
               | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
-              | VK_IMAGE_USAGE_SAMPLED_BIT;
-    if (sc->flip_gob_real) ici.usage |= VK_IMAGE_USAGE_STORAGE_BIT; /* gob_swizzle.comp imageLoad */
+              | VK_IMAGE_USAGE_SAMPLED_BIT
+              | VK_IMAGE_USAGE_STORAGE_BIT; /* gob_swizzle.comp imageLoad */
     ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
@@ -2244,19 +1865,7 @@ static VkResult create_app_image(DevNode *dev, Swapchain *sc, PerImage *pi) {
     if (mt < 0) mt = find_memtype(&dev->memp, mreq.memoryTypeBits, 0);
     if (mt < 0) { d->DestroyImage(dev->device, pi->image, NULL); pi->image = VK_NULL_HANDLE; return VK_ERROR_OUT_OF_DEVICE_MEMORY; }
 
-    VkExportMemoryAllocateInfo eai = { VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO };
     VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-    if (sc->flip_blocklinear) {
-        /* Deliberately NOT a dedicated allocation (no
-           VkMemoryDedicatedAllocateInfo) -- FLIP_TEST_SOLID_FILL needs to
-           alias a plain VkBuffer over this same memory afterward (see
-           flip_alias_buf below), which the spec disallows on memory
-           dedicated to a different resource. Tested empirically: GetMemoryFdKHR
-           still succeeds without dedication on this driver for a plain 2D
-           color image (no multi-planar/compressed format requiring it). */
-        eai.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
-        mai.pNext = &eai;
-    }
     mai.allocationSize = mreq.size; mai.memoryTypeIndex = (uint32_t)mt;
 
     r = d->AllocateMemory(dev->device, &mai, NULL, &pi->memory);
@@ -2264,43 +1873,6 @@ static VkResult create_app_image(DevNode *dev, Swapchain *sc, PerImage *pi) {
     r = d->BindImageMemory(dev->device, pi->image, pi->memory, 0);
     if (r != VK_SUCCESS) goto fail_mem;
 
-    if (sc->flip_blocklinear) {
-        VkMemoryGetFdInfoKHR gfi = { VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR };
-        gfi.memory = pi->memory; gfi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
-        r = d->GetMemoryFdKHR(dev->device, &gfi, &pi->flip_fd);
-        if (r != VK_SUCCESS || pi->flip_fd < 0) { if (r == VK_SUCCESS) r = VK_ERROR_UNKNOWN; goto fail_mem; }
-        pi->flip_offset = 0;
-        /* Matches NVIDIA's own captured stride for A8R8G8B8 blocklinear
-           (10240 for a 2560px-wide surface = width*4) -- the "stride" field
-           appears to stay the plain logical row pitch even under
-           BLOCKLINEAR; the DC derives the real tiled layout internally from
-           width + block_height_log2, not from a caller-supplied physical
-           pitch. Assumes 4 bytes/pixel, true for A8R8G8B8/A8B8G8R8. */
-        pi->flip_row_pitch = (VkDeviceSize)sc->extent.width * 4;
-
-        /* FLIP_TEST_SOLID_FILL's actual fix: a VkBuffer aliased over the
-           whole mreq.size (not just the logical image extent) so
-           vkCmdFillBuffer can stomp every physical byte, including any
-           tiling padding vkCmdClearColorImage can't reach. Created
-           regardless of whether solid-fill is active this run (cheap,
-           keeps this function simple); only used if it is. */
-        /* Same VUID-vkBindBufferMemory-memory-02726 requirement as
-           gob_dst_buf in create_gob_dest -- pi->memory was allocated with
-           OPAQUE_FD_BIT above (eai.handleTypes), so this buffer must
-           declare it too before being bound to that memory. */
-        VkExternalMemoryBufferCreateInfo embi = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO };
-        embi.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
-
-        VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-        bci.pNext = &embi;
-        bci.size = mreq.size;
-        bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        r = d->CreateBuffer(dev->device, &bci, NULL, &pi->flip_alias_buf);
-        if (r != VK_SUCCESS) goto fail_mem;
-        r = d->BindBufferMemory(dev->device, pi->flip_alias_buf, pi->memory, 0);
-        if (r != VK_SUCCESS) { d->DestroyBuffer(dev->device, pi->flip_alias_buf, NULL); pi->flip_alias_buf = VK_NULL_HANDLE; goto fail_mem; }
-    }
     return VK_SUCCESS;
 
 fail_mem:
@@ -2310,11 +1882,9 @@ fail_img:
     return r;
 }
 
-/* FLIP_TEST_BLOCKLINEAR: no separate detile image needed (create_app_image
-   exports pi->image directly), but we still need a command buffer + fence
-   for the worker's per-frame wait-on-vk_render_done / signal-gl_sample_done
-   submission (see worker_thread_main) -- it's just an empty command buffer
-   now instead of one recording a copy. */
+/* Command buffer + fence for the worker's per-frame wait-on-vk_render_done /
+   signal-gl_sample_done submission (see worker_thread_main), used alongside
+   the GOB compute dispatch. */
 static bool create_flip_sync_only(DevNode *dev, Swapchain *sc, PerImage *pi) {
     DeviceDispatch *d = &dev->d;
     VkCommandBufferAllocateInfo cbai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
@@ -2362,331 +1932,8 @@ fail_a:
     return r;
 }
 
-/* FLIP_TEST_GOB_PROBE=2: candidate intra-GOB byte swizzle for the standard
- * Fermi/Maxwell/Tegra "block-linear" GOB format (64 bytes wide x 8 rows
- * tall), best-effort recollection of the documented bit-interleave pattern
- * -- NOT independently re-verified from a primary source for this exact
- * revision, deliberately tested empirically below rather than trusted
- * blindly (this codebase already got burned once assuming a remembered
- * detail was right -- see FLIP_TEST_BLOCKHEIGHT_LOG2's history). x is a
- * byte offset within the GOB row (0-63), y is the row within the GOB
- * (0-7); returns the swizzled byte offset within the 512-byte GOB (0-511).
- * High bits of x/y are interleaved; the low 4 bits of x stay contiguous
- * (keeps small runs, e.g. one 4-byte pixel, un-split.) */
-static inline uint32_t gob_swizzle(uint32_t x, uint32_t y) {
-    uint32_t x0 = x & 1, x1 = (x >> 1) & 1, x2 = (x >> 2) & 1;
-    uint32_t x3 = (x >> 3) & 1, x4 = (x >> 4) & 1, x5 = (x >> 5) & 1;
-    uint32_t y0 = y & 1, y1 = (y >> 1) & 1, y2 = (y >> 2) & 1;
-    return (x5 << 8) | (y2 << 7) | (y1 << 6) | (x4 << 5) | (y0 << 4) | (x3 << 3) | (x2 << 2) | (x1 << 1) | x0;
-}
-
-/* FLIP_TEST: create the separate LINEAR, exportable "detile target" image
- * for this slot, transition it once to GENERAL (the only layout linear
- * images reliably support besides PREINITIALIZED per spec), and allocate
- * the per-image command buffer + fence the worker will reuse every frame
- * for the vkCmdCopyImage detile step. No GL involved at all. */
-static bool create_flip_export_image(DevNode *dev, Swapchain *sc, PerImage *pi) {
-    DeviceDispatch *d = &dev->d;
-    pi->flip_fd = -1;
-
-    VkExternalMemoryImageCreateInfo emi = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };
-    emi.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
-
-    VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-    ici.pNext = &emi;
-    ici.imageType = VK_IMAGE_TYPE_2D;
-    ici.format = sc->format;
-    ici.extent.width = sc->extent.width;
-    ici.extent.height = sc->extent.height;
-    ici.extent.depth = 1;
-    ici.mipLevels = 1; ici.arrayLayers = 1;
-    ici.samples = VK_SAMPLE_COUNT_1_BIT;
-    ici.tiling = VK_IMAGE_TILING_LINEAR;
-    ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-
-    if (d->CreateImage(dev->device, &ici, NULL, &pi->flip_image) != VK_SUCCESS)
-        return false;
-
-    VkMemoryRequirements mreq;
-    d->GetImageMemoryRequirements(dev->device, pi->flip_image, &mreq);
-
-    int mt = -1;
-    if (sc->flip_gob_probe) {
-        /* Need CPU write access to hand-write the test pattern -- this
-           device exposes a DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT type
-           for LINEAR color images (confirmed via vulkaninfo), so this
-           isn't a fallback-to-slow-memory path, just a different valid
-           type for the same UMA pool. */
-        mt = find_memtype(&dev->memp, mreq.memoryTypeBits,
-                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
-                           | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        if (mt < 0) mt = find_memtype(&dev->memp, mreq.memoryTypeBits,
-                                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    }
-    if (mt < 0) mt = find_memtype(&dev->memp, mreq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (mt < 0) mt = find_memtype(&dev->memp, mreq.memoryTypeBits, 0);
-    if (mt < 0) goto fail_img;
-
-    /* FLIP_TEST_GOB_PROBE: over-allocate generously (256MB, small next to
-       the ~2.6GB heap) instead of the exact mreq.size, and write the test
-       pattern across the WHOLE allocation, not just the logical image
-       extent -- the first probe run (2026-08-16) showed a "flickering"
-       region on screen even though all 3 buffer slots hold identical
-       static data, meaning some of what the DC reads under BLOCKLINEAR
-       falls outside what we wrote (same out-of-bounds read suspected
-       earlier for flip_blocklinear). A dedicated allocation
-       (VkMemoryDedicatedAllocateInfo) forces allocationSize to exactly
-       match mreq.size per spec, so it's skipped here, same fix as the
-       flip_alias_buf path. */
-    VkDeviceSize alloc_size = mreq.size;
-    if (sc->flip_gob_probe) {
-        VkDeviceSize generous = (VkDeviceSize)256 * 1024 * 1024;
-        if (alloc_size < generous) alloc_size = generous;
-    }
-
-    VkExportMemoryAllocateInfo eai = { VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO };
-    eai.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
-    VkMemoryDedicatedAllocateInfo dai = { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO };
-    if (!sc->flip_gob_probe) {
-        dai.image = pi->flip_image;
-        eai.pNext = &dai;
-    }
-    VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-    mai.pNext = &eai; mai.allocationSize = alloc_size; mai.memoryTypeIndex = (uint32_t)mt;
-
-    if (d->AllocateMemory(dev->device, &mai, NULL, &pi->flip_memory) != VK_SUCCESS)
-        goto fail_img;
-    if (d->BindImageMemory(dev->device, pi->flip_image, pi->flip_memory, 0) != VK_SUCCESS)
-        goto fail_mem;
-
-    VkMemoryGetFdInfoKHR gfi = { VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR };
-    gfi.memory = pi->flip_memory; gfi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
-    if (d->GetMemoryFdKHR(dev->device, &gfi, &pi->flip_fd) != VK_SUCCESS || pi->flip_fd < 0)
-        goto fail_mem;
-
-    VkImageSubresource subres = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0 };
-    VkSubresourceLayout layout;
-    d->GetImageSubresourceLayout(dev->device, pi->flip_image, &subres, &layout);
-    pi->flip_row_pitch = layout.rowPitch;
-    pi->flip_offset = layout.offset;
-
-    if (sc->flip_gob_probe == 2) {
-        /* Mode 2: apply the candidate gob_swizzle() formula ourselves at
-         * write time, targeting a full-width "block spans the whole row"
-         * layout (empirically confirmed by mode 1: block_idx maps cleanly
-         * and correctly onto output Y, one GOB-row-group per block, GOBs
-         * laid out row-major -- all gob_col values for gob_row 0, then all
-         * for gob_row 1, etc. -- across the full image width). Writes a
-         * plain, clean (x,y) gradient (RED=x, GREEN=y) AT the swizzled
-         * address for each logical pixel. If gob_swizzle() matches the
-         * DC's real intra-GOB byte order, the BLOCKLINEAR-flagged read
-         * should reconstruct this gradient correctly -- a clean, smooth
-         * image, not the mode-1 scramble -- directly proving (or
-         * disproving) the candidate formula. Zeroes the whole allocation
-         * first so any address our loop doesn't reach (a wrong formula, or
-         * legitimate padding) reads back as black, not stale memory. */
-        long bhl2_for_pattern = 4;
-        {
-            const char *e = getenv("FLIP_TEST_BLOCKHEIGHT_LOG2");
-            bhl2_for_pattern = e ? atol(e) : 4;
-        }
-        VkDeviceSize rows_per_block = (VkDeviceSize)8 << bhl2_for_pattern;
-        VkDeviceSize gobs_per_block = rows_per_block / 8;
-        uint32_t width = sc->extent.width, height = sc->extent.height;
-        /* Round up -- see the matching comment in create_gob_dest. Also
-           overrides pi->flip_row_pitch (win.stride) below to match, for
-           the same reason: the DC must derive the same gobs_wide we used
-           to place our writes, or the two sides disagree about where each
-           block starts. */
-        uint32_t gobs_wide = (width * 4 + 63) / 64;
-        VkDeviceSize bytes_per_gob_row = (VkDeviceSize)gobs_wide * 512;
-        VkDeviceSize bytes_per_block = bytes_per_gob_row * gobs_per_block;
-        /* FLIP_TEST_GOB_ORDER: how GOBs are laid out within one block, still
-           an open question after the first mode-2 test nailed Y perfectly
-           but left X repeating every ~128-160px instead of sweeping the
-           full width once. 0 = row-major (all gob_col for gob_row 0, then
-           gob_row 1, ...; the mode-2 v1 assumption, produced the repeat).
-           1 = column-major (all gob_row_in_block for gob_col 0, then
-           gob_col 1, ...). 2 = GOB-level Morton/Z-order interleave of
-           gob_col and gob_row_in_block bits (one level up from the
-           intra-GOB byte swizzle, same idea applied to whole-GOB units). */
-        int gob_order = 0;
-        {
-            const char *e = getenv("FLIP_TEST_GOB_ORDER");
-            gob_order = e ? atoi(e) : 0;
-        }
-
-        void *mapped = NULL;
-        if (d->MapMemory(dev->device, pi->flip_memory, 0, VK_WHOLE_SIZE, 0, &mapped) == VK_SUCCESS) {
-            uint8_t *base = (uint8_t *)mapped + pi->flip_offset;
-            VkDeviceSize total = alloc_size - pi->flip_offset;
-            memset(base, 0, (size_t)total);
-
-            for (uint32_t y = 0; y < height; y++) {
-                VkDeviceSize block_idx = y / rows_per_block;
-                uint32_t row_in_block = (uint32_t)(y % rows_per_block);
-                uint32_t gob_row_in_block = row_in_block / 8;
-                uint32_t row_in_gob = row_in_block % 8;
-                uint32_t g = (uint32_t)(((uint64_t)y * 255) / (height > 1 ? height - 1 : 1));
-                for (uint32_t x = 0; x < width; x++) {
-                    uint32_t gob_col = x / 16;
-                    uint32_t x_in_gob_px = x % 16;
-                    uint32_t byte_x_in_gob = x_in_gob_px * 4;
-
-                    VkDeviceSize gob_index_in_block;
-                    if (gob_order == 1) {
-                        gob_index_in_block = (VkDeviceSize)gob_col * gobs_per_block + gob_row_in_block;
-                    } else if (gob_order == 2) {
-                        /* Bit-interleave gob_col (up to 8 bits) with
-                           gob_row_in_block (up to log2(gobs_per_block)
-                           bits), same spirit as gob_swizzle() but at the
-                           whole-GOB granularity. */
-                        VkDeviceSize idx = 0;
-                        for (int bit = 0; bit < 12; bit++) {
-                            uint32_t colbit = (gob_col >> bit) & 1;
-                            uint32_t rowbit = (bit < 8) ? ((gob_row_in_block >> bit) & 1) : 0;
-                            idx |= (VkDeviceSize)colbit << (bit * 2);
-                            idx |= (VkDeviceSize)rowbit << (bit * 2 + 1);
-                        }
-                        gob_index_in_block = idx;
-                    } else {
-                        gob_index_in_block = (VkDeviceSize)gob_row_in_block * gobs_wide + gob_col;
-                    }
-                    VkDeviceSize gob_base = block_idx * bytes_per_block + gob_index_in_block * 512;
-
-                    uint32_t rr = (uint32_t)(((uint64_t)x * 255) / (width > 1 ? width - 1 : 1));
-                    uint32_t c = 0xFF000000u | (rr << 16) | (g << 8) | 0x00u;
-
-                    for (int b = 0; b < 4; b++) {
-                        uint32_t swizzled = gob_swizzle(byte_x_in_gob + (uint32_t)b, row_in_gob);
-                        VkDeviceSize addr = gob_base + swizzled;
-                        if (addr < total) base[addr] = (uint8_t)(c >> (b * 8));
-                    }
-                }
-            }
-            d->UnmapMemory(dev->device, pi->flip_memory);
-            /* win.stride (set from this) must match the rounded-up
-               gobs_wide used for our own block-stride addressing above,
-               not the natural LINEAR-image row pitch queried earlier --
-               see the gobs_wide comment above. */
-            pi->flip_row_pitch = (VkDeviceSize)gobs_wide * 64;
-            LOG_INFO("FLIP_TEST: GOB swizzle verification pattern written (%ux%u, gobs_wide=%u, gobs_per_block=%llu)",
-                     width, height, gobs_wide, (unsigned long long)gobs_per_block);
-        } else {
-            LOG_WARN("FLIP_TEST: GOB probe MapMemory failed, pattern not written");
-        }
-    } else if (sc->flip_gob_probe) {
-        /* Mode 1: coordinate-revealing test pattern, written once via direct CPU
-         * mapping (HOST_COHERENT, no explicit flush needed), across the
-         * WHOLE over-sized allocation (alloc_size), not just the logical
-         * image extent -- extends the same formula past height using raw
-         * byte offset, so wherever an out-of-bounds DC read lands (see the
-         * alloc_size comment above), it still finds our deterministic
-         * pattern instead of unrelated memory. GOB = 16px wide x 8px tall
-         * for a 4-byte/pixel format.
-         *
-         * Revised 2026-08-16, third pass: v1 (8-color hue by vrow/8) and v2
-         * (6-hue family by block_idx) together established that block_idx
-         * (which of the rows_per_block-row groups) maps correctly and
-         * unscrambled onto output Y -- 12 clean horizontal bands in order.
-         * What's not yet known is what happens on X *within* one block's
-         * Y-band. This isolates exactly that: only "block 0" (vrow <
-         * rows_per_block) gets a real signal -- RED = row_in_block (which
-         * source row within the block), GREEN = vx (raw source column
-         * position in MY row-major addressing). Every other block is a flat
-         * gray marker. If GREEN varies smoothly left-to-right, source
-         * column is preserved; if constant, the DC re-reads one column; if
-         * it jumps/reorders, that's the scramble made visible directly. */
-        long bhl2_for_pattern = 4;
-        {
-            const char *e = getenv("FLIP_TEST_BLOCKHEIGHT_LOG2");
-            bhl2_for_pattern = e ? atol(e) : 4;
-        }
-        VkDeviceSize rows_per_block = (VkDeviceSize)8 << bhl2_for_pattern;
-        void *mapped = NULL;
-        if (d->MapMemory(dev->device, pi->flip_memory, 0, VK_WHOLE_SIZE, 0, &mapped) == VK_SUCCESS) {
-            uint8_t *base = (uint8_t *)mapped + pi->flip_offset;
-            VkDeviceSize total = alloc_size - pi->flip_offset;
-            for (VkDeviceSize off = 0; off + 4 <= total; off += 4) {
-                VkDeviceSize vrow = off / pi->flip_row_pitch;
-                uint32_t vx = (uint32_t)((off % pi->flip_row_pitch) / 4);
-                uint32_t c;
-                if (vrow < rows_per_block) {
-                    uint32_t r = (uint32_t)((vrow * 255) / (rows_per_block > 1 ? rows_per_block - 1 : 1));
-                    uint32_t g = (uint32_t)(((uint64_t)vx * 255) / (sc->extent.width > 1 ? sc->extent.width - 1 : 1));
-                    c = 0xFF000000u | (r << 16) | (g << 8) | 0x00u;
-                } else {
-                    c = 0xFF202020u; /* flat dark gray: "outside block 0" marker */
-                }
-                /* off is always 4-byte-aligned by construction (starts at
-                   0, increments by 4) and base comes from a page-aligned
-                   mapping -- a direct store avoids per-word memcpy() call
-                   overhead across up to 768MB total (3 slots x 256MB). */
-                *(uint32_t *)(base + off) = c;
-            }
-            d->UnmapMemory(dev->device, pi->flip_memory);
-            LOG_INFO("FLIP_TEST: GOB probe pattern written across %llu bytes (row_pitch=%llu, %ux%u logical)",
-                     (unsigned long long)total, (unsigned long long)pi->flip_row_pitch,
-                     sc->extent.width, sc->extent.height);
-        } else {
-            LOG_WARN("FLIP_TEST: GOB probe MapMemory failed, pattern not written");
-        }
-    }
-
-    /* One-time UNDEFINED -> GENERAL transition. */
-    VkCommandBufferAllocateInfo cbai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-    cbai.commandPool = sc->flip_cpool;
-    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cbai.commandBufferCount = 1;
-    VkCommandBuffer setup_cb;
-    if (d->AllocateCommandBuffers(dev->device, &cbai, &setup_cb) != VK_SUCCESS)
-        goto fail_mem;
-
-    VkCommandBufferBeginInfo cbbi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-    cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    d->BeginCommandBuffer(setup_cb, &cbbi);
-    VkImageMemoryBarrier barrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = pi->flip_image;
-    barrier.subresourceRange = (VkImageSubresourceRange){ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    d->CmdPipelineBarrier(setup_cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
-    d->EndCommandBuffer(setup_cb);
-
-    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &setup_cb;
-    VkResult sr = queue_submit_locked(dev, dev->graphics_queue, 1, &si, VK_NULL_HANDLE);
-    if (sr == VK_SUCCESS)
-        d->DeviceWaitIdle(dev->device); /* one-time setup cost, not per-frame */
-    d->FreeCommandBuffers(dev->device, sc->flip_cpool, 1, &setup_cb);
-    if (sr != VK_SUCCESS) goto fail_mem;
-
-    /* Per-frame command buffer + fence, allocated once and reused. */
-    if (d->AllocateCommandBuffers(dev->device, &cbai, &pi->flip_cmdbuf) != VK_SUCCESS)
-        goto fail_mem;
-    VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-    if (d->CreateFence(dev->device, &fci, NULL, &pi->flip_fence) != VK_SUCCESS)
-        goto fail_mem;
-
-    return true;
-
-fail_mem:
-    if (pi->flip_fd >= 0) { close(pi->flip_fd); pi->flip_fd = -1; }
-    d->FreeMemory(dev->device, pi->flip_memory, NULL); pi->flip_memory = VK_NULL_HANDLE;
-fail_img:
-    d->DestroyImage(dev->device, pi->flip_image, NULL); pi->flip_image = VK_NULL_HANDLE;
-    return false;
-}
-
-/* FLIP_TEST_GOB_REAL: shared compute pipeline (one set for the whole
- * swapchain) that applies gob_swizzle.comp -- the verified GOB block-linear
+/* Shared compute pipeline (one set for the whole swapchain) that applies
+ * gob_swizzle.comp -- the verified GOB block-linear
  * transform -- to convert each frame's rendered OPTIMAL image into a real
  * block-linear byte buffer FLIP4 can present directly. Binding 0: storage
  * image (source, app's rendered content). Binding 1: storage buffer
@@ -2757,18 +2004,16 @@ static bool create_gob_pipeline(DevNode *dev, Swapchain *sc) {
     return true;
 }
 
-/* FLIP_TEST_GOB_REAL: per-image destination buffer (the real block-linear
- * target, exported for FLIP4), source image view, and descriptor set. Sized
- * generously (roughly 1.25x the exact block-linear footprint) as a safety
- * margin -- same rationale as the earlier out-of-bounds-read fix, in case
- * the true footprint has rounding this formula doesn't yet account for. */
+/* Per-image destination buffer (the real block-linear target, exported for
+ * FLIP4), source image view, and descriptor set. Sized generously (roughly
+ * 1.25x the exact block-linear footprint) as a safety margin -- same
+ * rationale as the earlier out-of-bounds-read fix, in case the true
+ * footprint has rounding this formula doesn't yet account for. */
 static bool create_gob_dest(DevNode *dev, Swapchain *sc, PerImage *pi) {
     DeviceDispatch *d = &dev->d;
     pi->gob_dst_fd = -1;
 
-    /* Every content path needs its own per-frame command buffer + fence
-       (see create_flip_sync_only) -- this mode has no separate detile
-       target to also create it as a side effect of, so do it explicitly. */
+    /* Per-frame command buffer + fence (see create_flip_sync_only). */
     if (!create_flip_sync_only(dev, sc, pi))
         return false;
 
@@ -2785,7 +2030,7 @@ static bool create_gob_dest(DevNode *dev, Swapchain *sc, PerImage *pi) {
        enough by itself (tried 2026-08-16, made it worse) -- the DC derives
        its own internal gobs_wide from win.stride, so that must be told
        the same rounded-up value too, not the raw width*4 (see
-       pi->flip_row_pitch below), or the two sides disagree about where
+       pi->gob_row_pitch below), or the two sides disagree about where
        each block starts. */
     uint32_t gobs_wide = (width * 4 + 63) / 64;
     long bhl2 = sc->gob_block_height_log2;
@@ -2879,12 +2124,10 @@ static bool create_gob_dest(DevNode *dev, Swapchain *sc, PerImage *pi) {
     writes[1].pBufferInfo = &dbi;
     d->UpdateDescriptorSets(dev->device, 2, writes, 0, NULL);
 
-    pi->flip_fd = -1; /* not used in this mode; buff_id comes from gob_dst_fd */
-    pi->flip_offset = 0;
     /* win.stride (set from this) must match the rounded-up gobs_wide used
        for our own block-stride addressing above, not the raw width*4 --
        see the gobs_wide comment. */
-    pi->flip_row_pitch = (VkDeviceSize)gobs_wide * 64;
+    pi->gob_row_pitch = (VkDeviceSize)gobs_wide * 64;
     return true;
 
 fail_view:
@@ -3170,26 +2413,21 @@ static void destroy_perimage(DevNode *dev, Swapchain *sc, PerImage *pi) {
     if (pi->gl_sample_done) d->DestroySemaphore(dev->device, pi->gl_sample_done, NULL);
     if (pi->acquire_fence)  d->DestroyFence    (dev->device, pi->acquire_fence, NULL);
     if (pi->image)          d->DestroyImage    (dev->device, pi->image, NULL);
-    if (pi->flip_alias_buf) d->DestroyBuffer   (dev->device, pi->flip_alias_buf, NULL);
     if (pi->memory)         d->FreeMemory      (dev->device, pi->memory, NULL);
 
-    /* FLIP_TEST: the separate no-GL detile target and its per-frame
-     * command buffer/fence. The command buffer is freed implicitly when
-     * sc->flip_cpool is destroyed (DestroySwapchainKHR), not here. */
-    if (pi->flip_fence)  d->DestroyFence(dev->device, pi->flip_fence, NULL);
-    if (pi->flip_image)  d->DestroyImage(dev->device, pi->flip_image, NULL);
-    if (pi->flip_memory) d->FreeMemory  (dev->device, pi->flip_memory, NULL);
-    if (pi->flip_fd >= 0) close(pi->flip_fd);
+    /* Per-frame command buffer/fence for the GOB compute dispatch. The
+     * command buffer is freed implicitly when sc->flip_cpool is destroyed
+     * (DestroySwapchainKHR), not here. */
+    if (pi->flip_fence) d->DestroyFence(dev->device, pi->flip_fence, NULL);
 
-    /* FLIP_TEST_GOB_REAL: gob_dset is freed implicitly when sc->gob_dpool
-     * is destroyed (DestroySwapchainKHR), not here. */
+    /* gob_dset is freed implicitly when sc->gob_dpool is destroyed
+     * (DestroySwapchainKHR), not here. */
     if (pi->gob_src_view) d->DestroyImageView(dev->device, pi->gob_src_view, NULL);
     if (pi->gob_dst_buf)  d->DestroyBuffer   (dev->device, pi->gob_dst_buf, NULL);
     if (pi->gob_dst_mem)  d->FreeMemory      (dev->device, pi->gob_dst_mem, NULL);
     if (pi->gob_dst_fd >= 0) close(pi->gob_dst_fd);
 
     memset(pi, 0, sizeof(*pi));
-    pi->flip_fd = -1;
     pi->gob_dst_fd = -1;
 }
 
@@ -3795,8 +3033,8 @@ layer_CreateSwapchainKHR(VkDevice device,
 
     /* FLIP_TEST: open the DC device, claim our window, and create the
      * command pool BEFORE the per-image loop, since each image's
-     * create_flip_export_image() needs the pool to record its one-time
-     * layout-transition command buffer. This prototype exists specifically
+     * create_gob_dest() needs the pool for its per-frame command buffer.
+     * This prototype exists specifically
      * to test FLIP4 (see README.md) -- if any of this fails, that's a
      * setup bug worth surfacing loudly, not something to silently paper
      * over with a different presentation mechanism. Hard-fail the
@@ -3865,140 +3103,16 @@ layer_CreateSwapchainKHR(VkDevice device,
         goto fail_perimg;
     }
 
-    /* FLIP_TEST Option 1 / 1b setup: resolve the DC's real vblank syncpoint
-     * id (TEGRA_DC_EXT_GET_VBLANK_SYNCPT -- confirmed via kernel source to
-     * be normal copy_to_user pointer semantics, unlike GET_WINDOW's
-     * direct-value quirk) and open /dev/nvhost-ctrl, needed by either
-     * FLIP_TEST_KERNEL_WAIT (per-frame NVHOST_IOCTL_CTRL_SYNCPT_READ to
-     * compute FLIP4's pre_syncpt_val) or FLIP_TEST_KERNEL_PACE (per-frame
-     * blocking NVHOST_IOCTL_CTRL_SYNCPT_WAITEX for GLX-free pacing). Hard-
-     * fail if requested but unavailable -- same policy as the rest of this
-     * file. The two modes are mutually exclusive; KERNEL_PACE wins if both
-     * are set, since it supersedes KERNEL_WAIT's job (precise submission
-     * timing) without needing FLIP4's own latch gate on top. */
-    sc->flip_nvhost_ctrl_fd = -1;
-    sc->flip_vblank_syncpt_id = FLIP_TEST_NVSYNCPT_INVALID;
+    /* FLIP_TEST_BLOCKHEIGHT_LOG2: block_height_log2 used both for the GOB
+     * compute shader's push constants and the FLIP4 windowattr -- see the
+     * gob_block_height_log2 comment on the Swapchain struct. */
     {
-        static int kernel_wait = -1, kernel_pace = -1;
-        if (kernel_wait < 0) {
-            const char *e = getenv("FLIP_TEST_KERNEL_WAIT");
-            kernel_wait = (e && atoi(e) != 0) ? 1 : 0;
-        }
-        if (kernel_pace < 0) {
-            const char *e = getenv("FLIP_TEST_KERNEL_PACE");
-            kernel_pace = e ? atoi(e) : 0;
-        }
-        sc->flip_kernel_pace = kernel_pace > 0;
-        sc->flip_pace_divisor = sc->flip_kernel_pace ? (uint32_t)kernel_pace : 0;
-        sc->flip_kernel_wait = (kernel_wait != 0) && !sc->flip_kernel_pace;
-        if (sc->flip_kernel_pace)
-            LOG_INFO("FLIP_TEST: GLX-free kernel pacing ENABLED (Option 1b), divisor=%u (~%.0ffps)",
-                     sc->flip_pace_divisor, 60.0 / sc->flip_pace_divisor);
-        else
-            LOG_INFO("FLIP_TEST: kernel-side pre_syncpt_id wait %s",
-                     sc->flip_kernel_wait ? "ENABLED (Option 1)" : "disabled (userspace SGI wait)");
-    }
-    if (sc->flip_kernel_wait || sc->flip_kernel_pace) {
-        __u32 syncpt_id = FLIP_TEST_NVSYNCPT_INVALID;
-        if (ioctl(sc->flip_dc_fd, TEGRA_DC_EXT_GET_VBLANK_SYNCPT, &syncpt_id) < 0) {
-            LOG_ERR("FLIP_TEST: GET_VBLANK_SYNCPT failed: %m");
-            goto fail_perimg;
-        }
-        sc->flip_nvhost_ctrl_fd = open("/dev/nvhost-ctrl", O_RDWR | O_CLOEXEC);
-        if (sc->flip_nvhost_ctrl_fd < 0) {
-            LOG_ERR("FLIP_TEST: open /dev/nvhost-ctrl failed: %m");
-            goto fail_perimg;
-        }
-        sc->flip_vblank_syncpt_id = syncpt_id;
-        LOG_INFO("FLIP_TEST: vblank syncpt id=%u, nvhost-ctrl fd=%d",
-                 syncpt_id, sc->flip_nvhost_ctrl_fd);
-
-        if (sc->flip_kernel_pace) {
-            struct nvhost_ctrl_syncpt_read_args rd = { .id = syncpt_id };
-            if (ioctl(sc->flip_nvhost_ctrl_fd, NVHOST_IOCTL_CTRL_SYNCPT_READ, &rd) < 0) {
-                LOG_ERR("FLIP_TEST: initial SYNCPT_READ failed: %m");
-                goto fail_perimg;
-            }
-            sc->flip_pace_target = rd.value + sc->flip_pace_divisor;
-        }
-    }
-
-    /* FLIP_TEST_BLOCKLINEAR=1: see the flip_blocklinear comment on the
-     * Swapchain struct -- retest FLIP4 against NVIDIA's own observed
-     * tear-free tiling mode instead of the LINEAR detile target used by
-     * every earlier test in this prototype. */
-    {
-        static int blocklinear = -1;
-        if (blocklinear < 0) {
-            const char *e = getenv("FLIP_TEST_BLOCKLINEAR");
-            blocklinear = (e && atoi(e) != 0) ? 1 : 0;
-        }
-        sc->flip_blocklinear = blocklinear != 0;
-        LOG_INFO("FLIP_TEST: blocklinear scanout %s",
-                 sc->flip_blocklinear ? "ENABLED (retest vs NVIDIA's own tiling)" : "disabled (LINEAR detile target)");
-    }
-
-    /* FLIP_TEST_SOLID_FILL=1: see the flip_solid_fill comment on the
-     * Swapchain struct -- isolates whether BLOCKLINEAR itself changes
-     * tearing behavior, independent of whether our tiling layout is
-     * actually correct (it visually wasn't, per FLIP_TEST_BLOCKLINEAR
-     * testing on 2026-08-16). */
-    {
-        static int solid_fill = -1;
-        if (solid_fill < 0) {
-            const char *e = getenv("FLIP_TEST_SOLID_FILL");
-            solid_fill = (e && atoi(e) != 0) ? 1 : 0;
-        }
-        sc->flip_solid_fill = solid_fill != 0;
-        sc->flip_solid_fill_counter = 0;
-        LOG_INFO("FLIP_TEST: solid alternating fill %s",
-                 sc->flip_solid_fill ? "ENABLED (tearing-causality test)" : "disabled");
-    }
-
-    /* FLIP_TEST_GOB_PROBE=<1|2>: see the flip_gob_probe comment on the
-     * Swapchain struct -- empirically derives the DC's real BLOCKLINEAR
-     * address permutation (mode 1) or tests a candidate swizzle formula
-     * directly (mode 2). */
-    {
-        static int gob_probe = -1;
-        if (gob_probe < 0) {
-            const char *e = getenv("FLIP_TEST_GOB_PROBE");
-            gob_probe = e ? atoi(e) : 0;
-            if (gob_probe < 0) gob_probe = 0;
-        }
-        sc->flip_gob_probe = gob_probe;
-        LOG_INFO("FLIP_TEST: GOB address probe %s",
-                 sc->flip_gob_probe == 1 ? "ENABLED, mode 1 (empirical tiling derivation)" :
-                 sc->flip_gob_probe == 2 ? "ENABLED, mode 2 (candidate swizzle verification)" : "disabled");
-    }
-
-    /* FLIP_TEST_GOB_REAL: see the flip_gob_real comment on the Swapchain
-     * struct -- real per-frame content through the verified GOB block-
-     * linear compute shader, combining correct content with the causally-
-     * verified tear-free BLOCKLINEAR path. Defaults ON as of 2026-08-17:
-     * this is the confirmed, tear-free, correct-content path every real
-     * app in this investigation (gears, vkcube, vkgears, dolphin-emu, the
-     * Play emulator) has been tested and fixed against -- there's no
-     * longer a reason to require opting into it explicitly. Set
-     * FLIP_TEST_GOB_REAL=0 to fall back to the plain LINEAR detile target
-     * (create_flip_export_image) or FLIP_TEST_BLOCKLINEAR's retest path,
-     * both still available for diagnostic use -- see the option reference
-     * near the top of README.md. */
-    {
-        static int gob_real = -1;
-        if (gob_real < 0) {
-            const char *e = getenv("FLIP_TEST_GOB_REAL");
-            gob_real = e ? (atoi(e) != 0 ? 1 : 0) : 1;
-        }
-        sc->flip_gob_real = gob_real != 0;
         static long bhl2 = -1;
         if (bhl2 < 0) {
             const char *e = getenv("FLIP_TEST_BLOCKHEIGHT_LOG2");
             bhl2 = e ? atol(e) : 4;
         }
         sc->gob_block_height_log2 = bhl2;
-        LOG_INFO("FLIP_TEST: GOB real-content compute path %s",
-                 sc->flip_gob_real ? "ENABLED" : "disabled");
     }
 
     VkCommandPoolCreateInfo cpci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
@@ -4009,32 +3123,22 @@ layer_CreateSwapchainKHR(VkDevice device,
         goto fail_perimg;
     }
 
-    if (sc->flip_gob_real && !create_gob_pipeline(dev, sc)) {
+    if (!create_gob_pipeline(dev, sc)) {
         LOG_ERR("FLIP_TEST: create_gob_pipeline failed");
         goto fail_perimg;
     }
 
     /* Allocate per-image Vulkan resources: the app-facing OPTIMAL image and
      * its semaphores (create_app_image/create_exportable_semaphores), plus
-     * the separate LINEAR detile target (create_flip_export_image) FLIP4
+     * the GOB block-linear destination buffer (create_gob_dest) FLIP4
      * actually presents. */
     for (uint32_t i = 0; i < sc->image_count; i++) {
         VkResult r = create_app_image(dev, sc, &sc->images[i]);
         if (r != VK_SUCCESS) { LOG_ERR("create_app_image[%u]: %d", i, r); goto fail_perimg; }
         r = create_exportable_semaphores(dev, &sc->images[i]);
         if (r != VK_SUCCESS) { LOG_ERR("create_exportable_semaphores[%u]: %d", i, r); goto fail_perimg; }
-        if (sc->flip_gob_real) {
-            if (!create_gob_dest(dev, sc, &sc->images[i])) {
-                LOG_ERR("FLIP_TEST: create_gob_dest[%u] failed", i);
-                goto fail_perimg;
-            }
-        } else if (sc->flip_blocklinear) {
-            if (!create_flip_sync_only(dev, sc, &sc->images[i])) {
-                LOG_ERR("FLIP_TEST: create_flip_sync_only[%u] failed", i);
-                goto fail_perimg;
-            }
-        } else if (!create_flip_export_image(dev, sc, &sc->images[i])) {
-            LOG_ERR("FLIP_TEST: create_flip_export_image[%u] failed", i);
+        if (!create_gob_dest(dev, sc, &sc->images[i])) {
+            LOG_ERR("FLIP_TEST: create_gob_dest[%u] failed", i);
             goto fail_perimg;
         }
 
@@ -4084,7 +3188,6 @@ fail_perimg:
     if (sc->gob_pipeline_layout) dev->d.DestroyPipelineLayout(dev->device, sc->gob_pipeline_layout, NULL);
     if (sc->gob_dsl)             dev->d.DestroyDescriptorSetLayout(dev->device, sc->gob_dsl, NULL);
     if (sc->flip_cpool) dev->d.DestroyCommandPool(dev->device, sc->flip_cpool, NULL);
-    if (sc->flip_nvhost_ctrl_fd >= 0) close(sc->flip_nvhost_ctrl_fd);
     if (sc->flip_dc_fd >= 0) close(sc->flip_dc_fd);
 fail_gl_setup:
     glXMakeCurrent(surf->dpy, None, NULL);
@@ -5156,8 +4259,6 @@ layer_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInfo *ci,
     D(AllocateMemory);
     D(FreeMemory);
     D(BindImageMemory);
-    D(MapMemory);
-    D(UnmapMemory);
     D(CreateSemaphore);
     D(DestroySemaphore);
     D(CreateFence);
@@ -5174,13 +4275,10 @@ layer_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInfo *ci,
     D(AllocateCommandBuffers);
     D(FreeCommandBuffers);
     D(BeginCommandBuffer);
-    D(CmdCopyImage);
-    D(CmdClearColorImage);
     D(CreateBuffer);
     D(DestroyBuffer);
     D(GetBufferMemoryRequirements);
     D(BindBufferMemory);
-    D(CmdFillBuffer);
     D(CreateShaderModule);
     D(DestroyShaderModule);
     D(CreateDescriptorSetLayout);
@@ -5199,7 +4297,6 @@ layer_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInfo *ci,
     D(CmdBindDescriptorSets);
     D(CmdDispatch);
     D(CmdPushConstants);
-    D(GetImageSubresourceLayout);
     D(CreateRenderPass);
     /* Vulkan 1.2 render pass v2: core name first, KHR alias as fallback
        for drivers that only expose the extension entrypoint. */

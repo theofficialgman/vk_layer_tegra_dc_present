@@ -40,36 +40,11 @@ to leave unset for normal use.
   slow (every submit becomes synchronous) -- one-shot fault localization
   only, not for normal runs.
 
-**Content path** (default: real content, GOB block-linear, tear-free)
-- `FLIP_TEST_GOB_REAL=0` -- disable the default. Real per-frame content
-  through the verified GOB block-linear compute shader is what every app
-  in this investigation (gears, vkcube, vkgears, dolphin-emu, the Play
-  emulator) has been tested and fixed against; there's no longer a reason
-  to opt out except to compare against the older paths below.
-- `FLIP_TEST_BLOCKLINEAR=1` -- (only takes effect with `FLIP_TEST_GOB_REAL=0`)
-  retest FLIP4 against a raw `BLOCKLINEAR`-flagged `OPTIMAL` image
-  directly, bypassing the GOB compute shader entirely. Historical: this is
-  what first proved BLOCKLINEAR itself is tear-free, before the correct
-  swizzle formula was derived (see "Update 2026-08-16" parts 1-2) -- the
-  content it produces is visually wrong (untiled), useful only for
-  re-confirming tearing behavior in isolation.
-- `FLIP_TEST_SOLID_FILL=1` -- alternating solid-color fill instead of real
-  content, isolating tearing-causality from content-correctness.
-  `FLIP_TEST_SOLID_FILL_PERIOD=<N>` overrides the toggle frequency
-  (default 20 frames, ~0.33s at 60fps).
-- `FLIP_TEST_GOB_PROBE=<1|2>` -- diagnostic patterns used to derive/verify
-  the GOB tiling formula: mode 1 writes a coordinate-revealing pattern to
-  a LINEAR buffer flagged BLOCKLINEAR (reveals the DC's real permutation
-  empirically); mode 2 writes a candidate swizzle and checks whether
-  BLOCKLINEAR-flagged FLIP4 reconstructs a clean gradient. Not for normal
-  use -- see "Update 2026-08-16 part 2".
+**Content path** (real content, GOB block-linear, tear-free -- the only
+path this layer has; see "Update 2026-08-19: production cleanup" for what
+was removed)
 - `FLIP_TEST_BLOCKHEIGHT_LOG2=<N>` -- override the block-linear
   `block_height_log2` (default 4).
-- `FLIP_TEST_GOB_ORDER=<0|1|2>` -- only relevant under
-  `FLIP_TEST_GOB_PROBE=2`; historical hypothesis-testing knob for GOB
-  ordering within a block (0 row-major, 1 column-major -- confirmed
-  correct, 2 Morton/Z-order interleave). Not used by the real GOB_REAL
-  path, which hardcodes the confirmed-correct column-major order.
 
 **Window / DC targeting**
 - `FLIP_TEST_DC=<N>` -- force `/dev/tegra_dc_<N>`, overriding the default
@@ -100,20 +75,6 @@ to leave unset for normal use.
 - `FLIP_TEST_FORCE_FIFO=1` -- force FIFO present mode regardless of what
   the app requests, for isolating whether a bug is specific to MAILBOX's
   displaced-image bookkeeping (see "Update 2026-08-17 part 3").
-- `FLIP_TEST_KERNEL_WAIT=1` -- Option 1: adds a hardware `pre_syncpt_id`
-  latch gate on top of the default GLX SGI wait. `FLIP_TEST_SYNCPT_OFFSET=<N>`
-  overrides its target delta (default 1); large values (e.g. 300) are a
-  proof-of-execution stall test, not a normal mode.
-- `FLIP_TEST_KERNEL_PACE=<N>` -- Option 1b: fully GLX-free pacing via a
-  blocking kernel syncpoint wait targeting every `N`th vblank (1 = ~60fps,
-  2 = ~30fps); takes priority over `FLIP_TEST_KERNEL_WAIT` if both are
-  set. Note a GLX context is still created and made current regardless --
-  this only changes the pacing wait itself, not the rest of the swapchain
-  setup. **Tested 2026-08-17 with `FLIP_TEST_GOB_REAL=1`: tears for the
-  first few seconds before settling, worse than the default GLX SGI wait.**
-  Kept for reference; not recommended over the default.
-- `FLIP_TEST_DELAY_US=<us>` -- extra sleep inserted right before `FLIP4`,
-  after the SGI wait. Used for a manual vblank-phase timing sweep.
 - `FLIP_TEST_WAIT_AFTER_FLIP=0` -- moves the SGI vblank wait back to
   *before* `FLIP4` (the pre-2026-08-18 default), giving the deferred
   kernel worker a guaranteed-maximal, but higher-latency, margin before
@@ -1537,3 +1498,55 @@ with piggybacking on `GetPhysicalDeviceSurfaceCapabilitiesKHR`, which only
 ever runs on the app's own thread at a moment it's actively using its own
 `Display*` -- by construction it can't outlive the app's own X11 usage the
 way a detached thread could.
+
+## Update 2026-08-19: production cleanup -- removed the non-default diagnostic paths
+
+`FLIP_TEST_GOB_REAL` (real per-frame content through the verified GOB
+block-linear compute shader) has been the confirmed, tear-free,
+correct-content default since 2026-08-17, and every other content/pacing
+path in this file existed only to get there or to compare against it
+along the way. With the investigation concluded, kept every one of those
+non-default code paths around only as dead weight and a growing set of
+branches a reader has to mentally rule out to understand what the layer
+actually does at runtime. Removed entirely, along with the env vars that
+selected them (setting any of these now does nothing -- the layer no
+longer reads them):
+
+- `FLIP_TEST_GOB_REAL=0` and the LINEAR detile-copy content path it fell
+  back to (`create_flip_export_image`, `pi->flip_image`/`flip_memory`/
+  `flip_fd`/`flip_row_pitch`/`flip_offset`) -- GOB block-linear content is
+  now the only path; the compute-shader dispatch in `worker_thread_main`
+  is unconditional.
+- `FLIP_TEST_BLOCKLINEAR` (raw `BLOCKLINEAR`-flagged `OPTIMAL` image,
+  bypassing the GOB compute shader) and its buffer-memory-aliasing
+  support in `create_app_image` (`flip_alias_buf`, the export-capable
+  memory allocation).
+- `FLIP_TEST_SOLID_FILL` / `FLIP_TEST_SOLID_FILL_PERIOD` (alternating
+  solid-color fill instead of real content).
+- `FLIP_TEST_GOB_PROBE=<1|2>` (coordinate-revealing / candidate-swizzle
+  diagnostic patterns used to originally derive the GOB tiling formula --
+  see "Update 2026-08-16 part 2", still an accurate historical record of
+  how that formula was found even though the code that ran it is gone)
+  and `FLIP_TEST_GOB_ORDER` (only relevant under `GOB_PROBE=2`).
+- `FLIP_TEST_KERNEL_WAIT` / `FLIP_TEST_SYNCPT_OFFSET` (Option 1: hardware
+  `pre_syncpt_id` latch gate) and `FLIP_TEST_KERNEL_PACE` (Option 1b:
+  fully GLX-free pacing) -- see "Update" sections referencing "Option 1"/
+  "Option 1b" below for why neither beat the default GLX SGI wait.
+  `flip_nvhost_ctrl_fd`/`flip_vblank_syncpt_id` and the `/dev/nvhost-ctrl`
+  open + `TEGRA_DC_EXT_GET_VBLANK_SYNCPT` resolution they needed are gone
+  with them; `win.pre_syncpt_id` is now always
+  `FLIP_TEST_NVSYNCPT_INVALID`.
+- `FLIP_TEST_DELAY_US` (manual pre-FLIP4 timing sweep knob).
+
+`FLIP_TEST_BLOCKHEIGHT_LOG2` and `FLIP_TEST_WAIT_AFTER_FLIP` stay -- both
+are still-relevant tuning knobs for the one remaining content/pacing path,
+not alternate paths. The sections below documenting the investigation
+(Options 1/1b testing, the GOB tiling formula derivation, the
+BLOCKLINEAR/SOLID_FILL causality tests) are left as-is as the historical
+record of how the current default was arrived at; the env vars they
+mention no longer do anything.
+
+Also removed the now-fully-unused `MapMemory`/`UnmapMemory`/
+`CmdClearColorImage`/`CmdFillBuffer`/`CmdCopyImage`/
+`GetImageSubresourceLayout` entries from the device dispatch table --
+each was used only by one of the paths above.
