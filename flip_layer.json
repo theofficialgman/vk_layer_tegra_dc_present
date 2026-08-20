@@ -3,7 +3,7 @@
     "layer": {
         "name": "VK_LAYER_FLIP_test",
         "type": "GLOBAL",
-        "library_path": "./libVkLayer_flip_test.so",
+        "library_path": "libVkLayer_flip_test.so",
         "api_version": "1.1.85",
         "implementation_version": "1",
         "description": "Prototype: presents via direct TEGRA_DC_EXT_FLIP4 instead of glXSwapBuffers, for tearing comparison testing.",

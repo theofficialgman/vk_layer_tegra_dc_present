@@ -238,10 +238,16 @@ gcc -O2 -g -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers \
     -fPIC -fvisibility=hidden -shared -Wl,--no-undefined -Wl,--version-script=flip_layer.map \
     -I. -o libVkLayer_flip_test.so flip_layer.c -lpthread -ldl
 
-VK_LAYER_PATH=$(pwd) VK_INSTANCE_LAYERS=VK_LAYER_FLIP_test VK_TEGRA_X11_PRESENT_LOG=2 \
+LD_LIBRARY_PATH=$(pwd) VK_LAYER_PATH=$(pwd) VK_INSTANCE_LAYERS=VK_LAYER_FLIP_test VK_TEGRA_X11_PRESENT_LOG=2 \
     ~/Vulkan/build/bin/gears -vs        # windowed -- falls through to native WSI, see part 4
     # or: ~/Vulkan/build/bin/gears -f -vs   # fullscreen -- engages FLIP4, tear-free by default
 ```
+
+`library_path` in `flip_layer.json` is a bare filename (matching what actually
+gets installed system-wide -- see "Update 2026-08-19 part 4" below), so
+ad-hoc runs straight from this directory need `LD_LIBRARY_PATH` too, or the
+loader finds the manifest but fails to `dlopen` the `.so` ("cannot open
+shared object file").
 
 See the "Environment variable reference" section near the top of this file
 for every env var this layer reads and what it does -- the defaults
