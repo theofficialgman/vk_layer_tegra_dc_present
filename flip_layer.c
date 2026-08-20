@@ -513,10 +513,15 @@ static void layer_log(int lvl, const char *prefix, const char *fmt, ...) {
 static bool g_layer_disabled = false;
 
 static void layer_check_disabled(void) {
+    /* Matches the JSON manifest's disable_environment semantics: presence
+     * disables regardless of value, since that's the loader-level gate
+     * that decides whether this .so gets dlopen'd at all in the implicit-
+     * layer case. Keeping this check value-agnostic too means there's
+     * only one rule to document instead of two that can disagree. */
     const char *d = getenv("VK_TEGRA_DC_PRESENT_DISABLE");
-    if (d && d[0] == '1') {
+    if (d) {
         g_layer_disabled = true;
-        LOG_INFO("layer disabled via VK_TEGRA_DC_PRESENT_DISABLE=1 (passthrough)");
+        LOG_INFO("layer disabled via VK_TEGRA_DC_PRESENT_DISABLE (passthrough)");
     }
 }
 

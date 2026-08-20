@@ -29,7 +29,9 @@ to leave unset for normal use.
 **Core behavior**
 - `VK_TEGRA_DC_PRESENT_DISABLE=1` -- transparent passthrough; the layer
   does nothing, native Vulkan WSI handles everything (tearing, same as no
-  layer at all). Useful for A/B comparison.
+  layer at all). Useful for A/B comparison. Setting this to ANY value
+  disables the layer, not just `1` -- don't set it at all if you want the
+  layer enabled.
 - `VK_TEGRA_DC_PRESENT_LOG=<0-3>` -- log level: 0 silent, 1 warn/err,
   2 info (recommended for normal runs), 3 debug.
 - `VK_TEGRA_DC_PRESENT_LOG_FILE=<path>` -- also append the log to a file.
