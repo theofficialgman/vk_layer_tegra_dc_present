@@ -2273,6 +2273,40 @@ static int detect_dc_for_window(Display *dpy, Window win, bool *out_is_fullscree
     return result;
 }
 
+/* Runs the exact same check layer_CreateSwapchainKHR uses (FULLSCREEN GATE,
+ * with the FLIP_TEST_ALLOW_WINDOWED override) to decide whether a swapchain
+ * for this surface will actually get the FLIP4 treatment or fall through to
+ * native passthrough WSI (fallback_to_native_swapchain).
+ *
+ * Surface capability/format/present-mode queries MUST answer with
+ * whichever of those two a real CreateSwapchainKHR call will actually take
+ * -- not unconditionally with this layer's own synthetic values. Confirmed
+ * 2026-08-19: DXVK (Proton/box64, LEGO Star Wars: The Complete Saga) got
+ * this layer's synthetic capabilities/formats/present-modes for a window
+ * that (at that exact query moment, before the WM had caught up) wasn't
+ * yet recognized as fullscreen, so CreateSwapchainKHR fell through to real
+ * native WSI -- but the swapchain it then built was validated against
+ * capabilities the real ICD never actually reported. The result was a
+ * continuous ~20 recreates/second storm (self-consistency check failing
+ * every single frame) and a blank white window -- confirmed absent
+ * entirely without this layer loaded at all. Query functions now run this
+ * same check and forward to the real ICD (via surf->icd_surface, never the
+ * raw wrapper handle -- see fallback_to_native_swapchain's comment for why
+ * that specific mistake previously caused a SIGSEGV) whenever native WSI
+ * is what will actually get used, so whichever path CreateSwapchainKHR
+ * takes, the app was already told the truth about it. */
+static bool surface_wants_flip4(Surface *s) {
+    bool flip_is_fullscreen = false;
+    detect_dc_for_window(s->dpy, s->window, &flip_is_fullscreen);
+    if (flip_is_fullscreen) return true;
+    static int allow_windowed = -1;
+    if (allow_windowed < 0) {
+        const char *e = getenv("FLIP_TEST_ALLOW_WINDOWED");
+        allow_windowed = (e && atoi(e) != 0) ? 1 : 0;
+    }
+    return allow_windowed != 0;
+}
+
 static void destroy_perimage(DevNode *dev, Swapchain *sc, PerImage *pi) {
     DeviceDispatch *d = &dev->d;
     (void)sc; /* unused now that there's no GL-side per-image state */
@@ -2412,9 +2446,10 @@ layer_GetPhysicalDeviceSurfaceSupportKHR(VkPhysicalDevice physicalDevice,
                                           VkSurfaceKHR surface,
                                           VkBool32 *pSupported) {
     Surface *s = as_surface(surface);
-    if (!s) {
+    if (!s || !surface_wants_flip4(s)) {
         InstNode *in = inst_lookup(dispatch_key(physicalDevice));
-        return in->d.GetPhysicalDeviceSurfaceSupportKHR(physicalDevice, queueFamilyIndex, surface, pSupported);
+        VkSurfaceKHR real = (s && s->icd_surface) ? s->icd_surface : surface;
+        return in->d.GetPhysicalDeviceSurfaceSupportKHR(physicalDevice, queueFamilyIndex, real, pSupported);
     }
     /* Any graphics queue family supports our surface; we don't depend on
        Vulkan WSI presentation queues. */
@@ -2436,9 +2471,10 @@ layer_GetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice physicalDevice,
                                                VkSurfaceKHR surface,
                                                VkSurfaceCapabilitiesKHR *pCaps) {
     Surface *s = as_surface(surface);
-    if (!s) {
+    if (!s || !surface_wants_flip4(s)) {
         InstNode *in = inst_lookup(dispatch_key(physicalDevice));
-        return in->d.GetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice, surface, pCaps);
+        VkSurfaceKHR real = (s && s->icd_surface) ? s->icd_surface : surface;
+        return in->d.GetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice, real, pCaps);
     }
     uint32_t w = 0, h = 0; window_size(s, &w, &h);
     debug_log_fullscreen_sample(s);
@@ -2473,9 +2509,10 @@ layer_GetPhysicalDeviceSurfaceFormatsKHR(VkPhysicalDevice physicalDevice,
                                           uint32_t *pCount,
                                           VkSurfaceFormatKHR *pFormats) {
     Surface *s = as_surface(surface);
-    if (!s) {
+    if (!s || !surface_wants_flip4(s)) {
         InstNode *in = inst_lookup(dispatch_key(physicalDevice));
-        return in->d.GetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, surface, pCount, pFormats);
+        VkSurfaceKHR real = (s && s->icd_surface) ? s->icd_surface : surface;
+        return in->d.GetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, real, pCount, pFormats);
     }
     /* We support BGRA8 and RGBA8 UNORM and SRGB variants in OPTIMAL tiling
        with OPAQUE_FD export. These are the four formats we expose. */
@@ -2499,9 +2536,10 @@ layer_GetPhysicalDeviceSurfacePresentModesKHR(VkPhysicalDevice physicalDevice,
                                                uint32_t *pCount,
                                                VkPresentModeKHR *pModes) {
     Surface *s = as_surface(surface);
-    if (!s) {
+    if (!s || !surface_wants_flip4(s)) {
         InstNode *in = inst_lookup(dispatch_key(physicalDevice));
-        return in->d.GetPhysicalDeviceSurfacePresentModesKHR(physicalDevice, surface, pCount, pModes);
+        VkSurfaceKHR real = (s && s->icd_surface) ? s->icd_surface : surface;
+        return in->d.GetPhysicalDeviceSurfacePresentModesKHR(physicalDevice, real, pCount, pModes);
     }
     static const VkPresentModeKHR modes[] = {
         VK_PRESENT_MODE_FIFO_KHR,
@@ -2547,9 +2585,12 @@ layer_GetPhysicalDeviceSurfaceFormats2KHR(VkPhysicalDevice physicalDevice,
     if (!pSurfaceInfo) return VK_ERROR_VALIDATION_FAILED_EXT;
     Surface *s = as_surface(pSurfaceInfo->surface);
     InstNode *in = inst_lookup(dispatch_key(physicalDevice));
-    if (!s) {
-        if (in && in->d.GetPhysicalDeviceSurfaceFormats2KHR)
-            return in->d.GetPhysicalDeviceSurfaceFormats2KHR(physicalDevice, pSurfaceInfo, pCount, pFormats);
+    if (!s || !surface_wants_flip4(s)) {
+        if (in && in->d.GetPhysicalDeviceSurfaceFormats2KHR) {
+            VkPhysicalDeviceSurfaceInfo2KHR realInfo = *pSurfaceInfo;
+            if (s && s->icd_surface) realInfo.surface = s->icd_surface;
+            return in->d.GetPhysicalDeviceSurfaceFormats2KHR(physicalDevice, &realInfo, pCount, pFormats);
+        }
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     /* Get the v1 formats, then wrap each into a VkSurfaceFormat2KHR. */

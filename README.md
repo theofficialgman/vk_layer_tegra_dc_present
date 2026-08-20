@@ -1649,3 +1649,55 @@ block and the field are gone.
 
 Verified with `gears -f -vs` after each removal: clean full-length runs,
 no errors, fullscreen detection and FLIP4 unaffected throughout.
+
+## Update 2026-08-19 part 4: surface capability queries answered the wrong
+path -- broke Proton/DXVK/box64 (white screen, ~20 recreates/sec)
+
+Found via LEGO Star Wars: The Complete Saga (Steam, Proton 10.0, box64,
+DXVK): the game window opened as a blank white screen and stayed that way.
+`VK_TEGRA_X11_PRESENT_LOG_FILE=<path>` (needed because Steam redirects the
+actual game process's stdout/stderr to `/dev/null` regardless of how
+Steam itself is launched -- confirmed via `/proc/<pid>/fd/1`/`fd/2`, not
+fixable with shell redirection) showed `CreateSwapchainKHR` and
+`DestroySwapchainKHR` cycling roughly 20 times *per second*, every one
+logged "window is not fullscreen... falling through to native WSI" --
+despite `xwininfo` confirming the X11 window was already an exact
+`2560x1600+0+0` fullscreen match.
+
+Root cause: `GetPhysicalDeviceSurfaceCapabilitiesKHR` (and Formats/
+PresentModes/Support, and the "2" variants) answered with this layer's
+own synthetic values -- fixed `MIN_IMAGES`/`MAX_IMAGES`, a fixed format
+list, `FIFO`/`FIFO_RELAXED`/`IMMEDIATE` -- for *any* surface this layer
+wrapped, completely independent of whether that surface's swapchain would
+actually get the FLIP4 treatment or fall through to real native WSI via
+`fallback_to_native_swapchain()`. Every real app tested before this
+(gears, vkgears, DDNet, azahar, Play) happened not to care about that
+mismatch. DXVK does: it validates the swapchain it just created against
+the capabilities it was told, and when a windowed-fallback swapchain
+(created against the *real* ICD) didn't match what this layer had told it
+moments earlier (synthetic capabilities, never the real ICD's own
+answer), DXVK correctly concluded the swapchain was immediately
+suboptimal and recreated it -- forever, since the layer kept giving the
+same wrong answer every time, never letting a real frame display.
+
+Fixed with `surface_wants_flip4()`, a shared helper running the identical
+fullscreen check (`detect_dc_for_window` + `FLIP_TEST_ALLOW_WINDOWED`)
+`CreateSwapchainKHR` itself uses. All five capability/format/present-mode/
+support query functions now run this check and forward to the real ICD
+(via `surf->icd_surface` -- never the raw wrapper handle passed straight
+through, which is exactly the mistake `fallback_to_native_swapchain`'s own
+comment already documents as a prior SIGSEGV) whenever native WSI is what
+`CreateSwapchainKHR` will actually end up using. Whichever path a given
+swapchain takes, the app is now told the truth about it consistently
+across every query. `CreateSwapchainKHR`'s own inline fullscreen check
+(which also needs the detected DC index, not just the boolean
+`surface_wants_flip4()` returns) was left as-is rather than force a
+refactor -- both call sites run the same underlying deterministic check
+against the same window state, so they can't drift apart.
+
+Verified: LEGO Star Wars now opens and renders correctly, confirmed via
+the log going from a continuous recreate storm to exactly one
+`CreateSwapchainKHR`/`DestroySwapchainKHR` pair (a single legitimate
+windowed-at-launch -> fullscreen-once-the-WM-catches-up transition,
+exactly the pattern already relied on for every other app in this
+project).
