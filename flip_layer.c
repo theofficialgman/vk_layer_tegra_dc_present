@@ -1303,7 +1303,7 @@ static void *worker_thread_main(void *arg) {
                 uint64_t _now = (uint64_t)_ts.tv_sec * 1000000000ULL + (uint64_t)_ts.tv_nsec;
                 static int _reuse_log_count = 0;
                 if (pi->flip_last_ns != 0 && _reuse_log_count < 20) {
-                    LOG_INFO("FLIP_TEST: slot idx=%u reuse gap = %.2f ms",
+                    LOG_DBG("slot idx=%u reuse gap = %.2f ms",
                              idx, (double)(_now - pi->flip_last_ns) / 1e6);
                     _reuse_log_count++;
                 }
@@ -1378,7 +1378,7 @@ static void *worker_thread_main(void *arg) {
                 d->WaitForFences(sc->dev->device, 1, &pi->flip_fence, VK_TRUE, UINT64_MAX);
                 TRACE_SYNC("worker idx=%u flip_fence signaled", idx);
             } else {
-                LOG_WARN("FLIP_TEST: copy QueueSubmit failed: %d", sr);
+                LOG_WARN("copy QueueSubmit failed: %d", sr);
             }
 
             /* Wait for vblank AFTER FLIP4, not before -- default as of
@@ -1405,7 +1405,7 @@ static void *worker_thread_main(void *arg) {
             if (wait_after_flip < 0) {
                 const char *e = getenv("VK_TEGRA_DC_PRESENT_WAIT_AFTER_FLIP");
                 wait_after_flip = e ? (atoi(e) != 0 ? 1 : 0) : 1;
-                LOG_INFO("FLIP_TEST: SGI vblank wait ordering: %s",
+                LOG_INFO("SGI vblank wait ordering: %s",
                          wait_after_flip ? "after FLIP4 (default, lower latency)"
                                           : "before FLIP4 (VK_TEGRA_DC_PRESENT_WAIT_AFTER_FLIP=0, more conservative)");
             }
@@ -1510,11 +1510,11 @@ static void *worker_thread_main(void *arg) {
             if (_f4_log_count < 300) {
                 double _f4_ms = (_f4_t1.tv_sec - _f4_t0.tv_sec) * 1000.0 +
                                  (_f4_t1.tv_nsec - _f4_t0.tv_nsec) / 1e6;
-                LOG_INFO("FLIP_TEST: FLIP4 call itself took=%.3fms ret=%d", _f4_ms, _f4_ret);
+                LOG_DBG("FLIP4 call itself took=%.3fms ret=%d", _f4_ms, _f4_ret);
                 _f4_log_count++;
             }
             if (_f4_ret < 0)
-                LOG_WARN("FLIP_TEST: FLIP4 failed: %m");
+                LOG_WARN("FLIP4 failed: %m");
 
             /* Default (VK_TEGRA_DC_PRESENT_WAIT_AFTER_FLIP unset or 1) SGI vblank
                wait -- see the wait_after_flip comment above for why this
@@ -2208,7 +2208,7 @@ static int detect_dc_for_window(Display *dpy, Window win, bool *out_is_fullscree
     if (out_is_fullscreen) *out_is_fullscreen = false;
     if (!XRRGetScreenResourcesCurrent || !XRRGetCrtcInfo ||
         !XRRGetOutputInfo || !XTranslateCoordinates) {
-        LOG_WARN("FLIP_TEST: libXrandr not available, cannot auto-detect DC");
+        LOG_WARN("libXrandr not available, cannot auto-detect DC");
         return -1;
     }
     Window root;
@@ -2259,7 +2259,7 @@ static int detect_dc_for_window(Display *dpy, Window win, bool *out_is_fullscree
             if (oi) {
                 if (strcmp(oi->name, "DSI-0") == 0) result = 0;      /* internal panel */
                 else if (strcmp(oi->name, "DP-0") == 0) result = 1;  /* external/dock */
-                LOG_INFO("FLIP_TEST: window is on output '%s' -> %s%s",
+                LOG_INFO("window is on output '%s' -> %s%s",
                          oi->name, result >= 0 ? "recognized" : "UNRECOGNIZED (add a case in detect_dc_for_window)",
                          (out_is_fullscreen && *out_is_fullscreen) ? ", fullscreen" : ", windowed");
                 XRRFreeOutputInfo(oi);
@@ -2967,11 +2967,11 @@ layer_CreateSwapchainKHR(VkDevice device,
         const char *e = getenv("VK_TEGRA_DC_PRESENT_DC_INDEX");
         if (e) {
             flip_dc_num = atoi(e);
-            LOG_INFO("FLIP_TEST: DC%d forced via VK_TEGRA_DC_PRESENT_DC_INDEX", flip_dc_num);
+            LOG_INFO("DC%d forced via VK_TEGRA_DC_PRESENT_DC_INDEX", flip_dc_num);
         } else {
             flip_dc_num = flip_detected_dc;
             if (flip_dc_num < 0) {
-                LOG_WARN("FLIP_TEST: DC auto-detection failed, falling back to DC1");
+                LOG_WARN("DC auto-detection failed, falling back to DC1");
                 flip_dc_num = 1;
             }
         }
@@ -2983,7 +2983,7 @@ layer_CreateSwapchainKHR(VkDevice device,
     }
     char flip_dc_path[32];
     snprintf(flip_dc_path, sizeof(flip_dc_path), "/dev/tegra_dc_%d", flip_dc_num);
-    LOG_INFO("FLIP_TEST: targeting %s window %d", flip_dc_path, flip_win_index);
+    LOG_INFO("targeting %s window %d", flip_dc_path, flip_win_index);
     sc->flip_win_index = flip_win_index;
 
     /* O_CLOEXEC matters here: without it, a helper process the app forks
@@ -2998,11 +2998,11 @@ layer_CreateSwapchainKHR(VkDevice device,
      * EBUSY. */
     sc->flip_dc_fd = open(flip_dc_path, O_RDWR | O_CLOEXEC);
     if (sc->flip_dc_fd < 0) {
-        LOG_ERR("FLIP_TEST: open %s failed: %m", flip_dc_path);
+        LOG_ERR("open %s failed: %m", flip_dc_path);
         goto fail_perimg;
     }
     if (ioctl(sc->flip_dc_fd, TEGRA_DC_EXT_GET_WINDOW, (unsigned long)flip_win_index) < 0) {
-        LOG_ERR("FLIP_TEST: GET_WINDOW %d on %s failed: %m", flip_win_index, flip_dc_path);
+        LOG_ERR("GET_WINDOW %d on %s failed: %m", flip_win_index, flip_dc_path);
         goto fail_perimg;
     }
 
@@ -3022,12 +3022,12 @@ layer_CreateSwapchainKHR(VkDevice device,
     cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     cpci.queueFamilyIndex = 0; /* matches dev->graphics_queue selection elsewhere */
     if (dev->d.CreateCommandPool(dev->device, &cpci, NULL, &sc->flip_cpool) != VK_SUCCESS) {
-        LOG_ERR("FLIP_TEST: CreateCommandPool failed");
+        LOG_ERR("CreateCommandPool failed");
         goto fail_perimg;
     }
 
     if (!create_gob_pipeline(dev, sc)) {
-        LOG_ERR("FLIP_TEST: create_gob_pipeline failed");
+        LOG_ERR("create_gob_pipeline failed");
         goto fail_perimg;
     }
 
@@ -3041,7 +3041,7 @@ layer_CreateSwapchainKHR(VkDevice device,
         r = create_exportable_semaphores(dev, &sc->images[i]);
         if (r != VK_SUCCESS) { LOG_ERR("create_exportable_semaphores[%u]: %d", i, r); goto fail_perimg; }
         if (!create_gob_dest(dev, sc, &sc->images[i])) {
-            LOG_ERR("FLIP_TEST: create_gob_dest[%u] failed", i);
+            LOG_ERR("create_gob_dest[%u] failed", i);
             goto fail_perimg;
         }
 
@@ -3055,7 +3055,7 @@ layer_CreateSwapchainKHR(VkDevice device,
             goto fail_perimg;
         }
     }
-    LOG_INFO("FLIP_TEST: ready, window %d, out %ux%u",
+    LOG_INFO("ready, window %d, out %ux%u",
              sc->flip_win_index, sc->flip_out_w, sc->flip_out_h);
 
     /* Release the GLX context from this thread before the worker takes it. */
