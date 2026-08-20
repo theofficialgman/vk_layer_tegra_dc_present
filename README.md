@@ -27,13 +27,13 @@ either a diagnostic knob from the investigation or an escape hatch, safe
 to leave unset for normal use.
 
 **Core behavior**
-- `VK_TEGRA_X11_PRESENT_DISABLE=1` -- transparent passthrough; the layer
+- `VK_TEGRA_DC_PRESENT_DISABLE=1` -- transparent passthrough; the layer
   does nothing, native Vulkan WSI handles everything (tearing, same as no
   layer at all). Useful for A/B comparison.
-- `VK_TEGRA_X11_PRESENT_LOG=<0-3>` -- log level: 0 silent, 1 warn/err,
+- `VK_TEGRA_DC_PRESENT_LOG=<0-3>` -- log level: 0 silent, 1 warn/err,
   2 info (recommended for normal runs), 3 debug.
-- `VK_TEGRA_X11_PRESENT_LOG_FILE=<path>` -- also append the log to a file.
-- `VK_TEGRA_X11_PRESENT_DIAG=1` -- calls `vkDeviceWaitIdle` after every
+- `VK_TEGRA_DC_PRESENT_LOG_FILE=<path>` -- also append the log to a file.
+- `VK_TEGRA_DC_PRESENT_DIAG=1` -- calls `vkDeviceWaitIdle` after every
   single `vkQueueSubmit` (ours and the app's), logging a sequence number
   for each. Pinpoints exactly which submit faults instead of letting a GPU
   fault surface later as `DEVICE_LOST` on some unrelated call. Extremely
@@ -43,28 +43,28 @@ to leave unset for normal use.
 **Content path** (real content, GOB block-linear, tear-free -- the only
 path this layer has; see "Update 2026-08-19: production cleanup" for what
 was removed)
-- `FLIP_TEST_BLOCKHEIGHT_LOG2=<N>` -- override the block-linear
+- `VK_TEGRA_DC_PRESENT_BLOCKHEIGHT_LOG2=<N>` -- override the block-linear
   `block_height_log2` (default 4).
 
 **Window / DC targeting**
-- `FLIP_TEST_DC=<N>` -- force `/dev/tegra_dc_<N>`, overriding the default
+- `VK_TEGRA_DC_PRESENT_DC_INDEX=<N>` -- force `/dev/tegra_dc_<N>`, overriding the default
   XRandR-based auto-detection of which DC drives the window's current
   monitor.
-- `FLIP_TEST_WIN=<N>` -- force the DC window (hardware overlay plane)
+- `VK_TEGRA_DC_PRESENT_WIN_INDEX=<N>` -- force the DC window (hardware overlay plane)
   index (default 1). Ownership has only been verified free on DC1 window
   1 -- do not point this at a different DC/window without checking first.
-- `FLIP_TEST_ALLOW_WINDOWED=1` -- override the fullscreen gate (see
+- `VK_TEGRA_DC_PRESENT_ALLOW_WINDOWED=1` -- override the fullscreen gate (see
   "Update 2026-08-17 part 4") to test the FLIP4 path itself against a
   non-fullscreen window. The overlay's position will be wrong and it won't
   respect window occlusion -- diagnostic only, never for normal use.
-- `FLIP_TEST_ALLOW_IMMEDIATE=1` -- override the IMMEDIATE mode gate (see
+- `VK_TEGRA_DC_PRESENT_ALLOW_IMMEDIATE=1` -- override the IMMEDIATE mode gate (see
   "Update 2026-08-18 part 2") to test the FLIP4 path itself against a
   `VK_PRESENT_MODE_IMMEDIATE_KHR` swapchain. Real per-frame overhead with
   no tearing benefit for an app that already accepts tearing -- diagnostic
   only, never for normal use.
 
 **Buffering / pacing**
-- `FLIP_TEST_MIN_IMAGES=<N>` -- forces the swapchain image count to
+- `VK_TEGRA_DC_PRESENT_MIN_IMAGES=<N>` -- forces the swapchain image count to
   exactly `N`, overriding both the app's own request and the built-in
   safety floor (3, raised from 2 after "2-image swapchains are unsafe",
   see "Update 2026-08-17"). Works in both directions: `N` above what the
@@ -72,10 +72,10 @@ was removed)
   (including back down to 2) deliberately re-enables the confirmed
   2-image tearing bug on demand, e.g. to re-verify it against a specific
   app without a source edit. Logs a warning when going below the floor.
-- `FLIP_TEST_FORCE_FIFO=1` -- force FIFO present mode regardless of what
+- `VK_TEGRA_DC_PRESENT_FORCE_FIFO=1` -- force FIFO present mode regardless of what
   the app requests, for isolating whether a bug is specific to MAILBOX's
   displaced-image bookkeeping (see "Update 2026-08-17 part 3").
-- `FLIP_TEST_WAIT_AFTER_FLIP=0` -- moves the SGI vblank wait back to
+- `VK_TEGRA_DC_PRESENT_WAIT_AFTER_FLIP=0` -- moves the SGI vblank wait back to
   *before* `FLIP4` (the pre-2026-08-18 default), giving the deferred
   kernel worker a guaranteed-maximal, but higher-latency, margin before
   the next vblank. The default (unset, or explicitly `=1`) waits *after*
@@ -86,7 +86,7 @@ was removed)
   different driver, heavier scene, or under system load.
 
 **Debugging**
-- `FLIP_TEST_TRACE_SYNC=1` -- logs a global sequence-numbered trace of
+- `VK_TEGRA_DC_PRESENT_TRACE_SYNC=1` -- logs a global sequence-numbered trace of
   every touch of the per-image `vk_render_done`/`gl_sample_done`
   semaphores, tagged with the calling thread's TID. Built to chase the
   MAILBOX displaced-image race (see "Update 2026-08-17 part 3") by
@@ -234,20 +234,18 @@ specific reverse-engineered constants) rather than the sole fix.
 ## Build & run (explicit layer, no system install)
 
 ```sh
-gcc -O2 -g -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers \
-    -fPIC -fvisibility=hidden -shared -Wl,--no-undefined -Wl,--version-script=flip_layer.map \
-    -I. -o libVkLayer_flip_test.so flip_layer.c -lpthread -ldl
+make
 
-LD_LIBRARY_PATH=$(pwd) VK_LAYER_PATH=$(pwd) VK_INSTANCE_LAYERS=VK_LAYER_FLIP_test VK_TEGRA_X11_PRESENT_LOG=2 \
+LD_LIBRARY_PATH=$(pwd) VK_LAYER_PATH=$(pwd) VK_INSTANCE_LAYERS=VK_LAYER_TEGRA_dc_present VK_TEGRA_DC_PRESENT_LOG=2 \
     ~/Vulkan/build/bin/gears -vs        # windowed -- falls through to native WSI, see part 4
     # or: ~/Vulkan/build/bin/gears -f -vs   # fullscreen -- engages FLIP4, tear-free by default
 ```
 
-`library_path` in `flip_layer.json` is a bare filename (matching what actually
-gets installed system-wide -- see "Update 2026-08-19 part 4" below), so
-ad-hoc runs straight from this directory need `LD_LIBRARY_PATH` too, or the
-loader finds the manifest but fails to `dlopen` the `.so` ("cannot open
-shared object file").
+`library_path` in `VkLayer_tegra_dc_present.json` is a bare filename
+(matching what actually gets installed system-wide via `make install`),
+so ad-hoc runs straight from this directory need `LD_LIBRARY_PATH` too, or
+the loader finds the manifest but fails to `dlopen` the `.so` ("cannot
+open shared object file").
 
 See the "Environment variable reference" section near the top of this file
 for every env var this layer reads and what it does -- the defaults
@@ -390,7 +388,7 @@ across both gears, with diagonal banding. **This is expected in hindsight:
 guarantees it's the same block-linear variant `TEGRA_DC_EXT_FLIP_FLAG_
 BLOCKLINEAR` expects, just because both happen to be "tiled."
 
-Swept `FLIP_TEST_BLOCKHEIGHT_LOG2` (0, 4, 5) looking for a value that
+Swept `VK_TEGRA_DC_PRESENT_BLOCKHEIGHT_LOG2` (0, 4, 5) looking for a value that
 untangles it: each produced a *structurally different* corruption (0: image
 shredded into thin repeating horizontal bands with black gaps; 5: image
 doubled and vertically stretched), not a spectrum from "very wrong" to
@@ -481,7 +479,7 @@ DC-documented layout that this driver doesn't currently expose (no
 Followed the compute-shader path from the previous update's "if this ever
 gets revisited" list, but **empirically derived** the formula on this exact
 hardware rather than trusting a from-memory recollection of nouveau/Switch
-homebrew documentation -- the earlier `FLIP_TEST_BLOCKHEIGHT_LOG2` episode
+homebrew documentation -- the earlier `VK_TEGRA_DC_PRESENT_BLOCKHEIGHT_LOG2` episode
 already showed that a single wrong constant produces a plausible-but-wrong
 result that's hard to tell apart from "right architecture, needs tuning."
 
@@ -664,8 +662,8 @@ mode) -- independent of anything in this file, a flip to a disabled DC
 isn't expected to produce visible output no matter what device path is
 used.
 
-`FLIP_TEST_WIN=<N>` (default 1, same as the old hardcoded
-`FLIP_TEST_WIN_INDEX`) selects the window index at runtime, stored on
+`VK_TEGRA_DC_PRESENT_WIN_INDEX=<N>` (default 1, same as the old hardcoded
+`DEFAULT_WIN_INDEX`) selects the window index at runtime, stored on
 `sc->flip_win_index` for the worker thread to use consistently. **Window
 ownership has only ever been verified on DC1** -- window 1 being free
 there doesn't guarantee it's free on DC0 or any other DC; re-check
@@ -674,7 +672,7 @@ investigation) before pointing this at a different DC.
 
 **Superseded later the same day** -- see part 6 below: the DC device
 itself is now auto-detected at runtime instead of needing
-`FLIP_TEST_DC` set by hand.
+`VK_TEGRA_DC_PRESENT_DC_INDEX` set by hand.
 
 ## Update 2026-08-16 part 6: DC auto-detection via XRandR
 
@@ -687,7 +685,7 @@ output's name through a small hardware-specific table (`DSI-0` -> DC0,
 `DP-0` -> DC1 -- fixed by this SoC's physical display wiring, not something
 that changes at runtime; no Tegra-specific X11 property or public
 `tegra_dc_ext` ioctl exposes this mapping directly, checked `xrandr --props`
-for one and found only generic/KDE properties). `FLIP_TEST_DC=<N>`, if set,
+for one and found only generic/KDE properties). `VK_TEGRA_DC_PRESENT_DC_INDEX=<N>`, if set,
 still overrides detection entirely (forces a specific DC regardless of
 which output the window is on -- useful for testing). Falls back to DC1 if
 detection fails for any reason (no XRandR, unrecognized output name, etc.).
@@ -849,15 +847,15 @@ before we start rewriting that buffer's memory again -- producing a real,
 reproducible tear. The ~50ms margin from 3 images empirically eliminates
 it.
 
-Confirmed via a `FLIP_TEST_MIN_IMAGES` env override (temporary, forced
-`want` up regardless of `ci->minImageCount`): `FLIP_TEST_MIN_IMAGES=3
+Confirmed via a `VK_TEGRA_DC_PRESENT_MIN_IMAGES` env override (temporary, forced
+`want` up regardless of `ci->minImageCount`): `VK_TEGRA_DC_PRESENT_MIN_IMAGES=3
 vkgears -fullscreen` ran tear-free. Since a 2-image swapchain is
 apparently unsafe with this layer's architecture regardless of which app
 asks for it, this was made the permanent default rather than an opt-in
 flag: `MIN_IMAGES` (`flip_layer.c`) is now `3`, not `2`. Vulkan apps are
 required to handle the driver returning more images than requested (they
 must query the real count via `vkGetSwapchainImagesKHR`), so this is a
-safe, spec-compliant floor. `FLIP_TEST_MIN_IMAGES` remains available as an
+safe, spec-compliant floor. `VK_TEGRA_DC_PRESENT_MIN_IMAGES` remains available as an
 opt-in override for forcing *even more* images than 3, for further margin
 testing.
 
@@ -884,7 +882,7 @@ after:
 ```
 [...] DestroySwapchainKHR: swapchain=0x...        <- old 640x480 windowed swapchain torn down
 [...] FLIP_TEST: targeting /dev/tegra_dc_1 window 1 <- new fullscreen swapchain starting
-[VK_LAYER_FLIP_test ERR] FLIP_TEST: GET_WINDOW 1 on /dev/tegra_dc_1 failed: Device or resource busy
+[VK_LAYER_TEGRA_dc_present ERR] FLIP_TEST: GET_WINDOW 1 on /dev/tegra_dc_1 failed: Device or resource busy
 ```
 
 `worker_shutdown()` (called from `layer_DestroySwapchainKHR`) is fully
@@ -985,7 +983,7 @@ GPU wait (a semaphore never signaled) rather than memory corruption.
 None of these four fixed Play's actual hang. That took isolating the
 failure to `present_mode == VK_PRESENT_MODE_MAILBOX_KHR` specifically
 (Play requests MAILBOX; every other app tested so far requests FIFO or
-MAILBOX-with-low-throughput) via a `FLIP_TEST_FORCE_FIFO` diagnostic
+MAILBOX-with-low-throughput) via a `VK_TEGRA_DC_PRESENT_FORCE_FIFO` diagnostic
 override -- forcing FIFO made the hang disappear outright, pointing
 straight at `worker_post`'s MAILBOX "displaced image" bookkeeping
 (`QueuePresentKHR` / `worker_post` in `flip_layer.c`).
@@ -1011,7 +1009,7 @@ Getting "exactly one wait, exactly one signal" right against a fast
 MAILBOX app took five fixes, found in order as each one moved the failure
 point later instead of eliminating it (frame ~8 -> ~12 -> ~9 -> ~300 ->
 finally indefinite) -- the last two were only found by building a
-purpose-built trace tool (`FLIP_TEST_TRACE_SYNC=1`, a global sequence-
+purpose-built trace tool (`VK_TEGRA_DC_PRESENT_TRACE_SYNC=1`, a global sequence-
 numbered log of every touch of these semaphores with the calling thread's
 TID) after pure code reading stopped finding anything:
 
@@ -1078,8 +1076,8 @@ Confirmed fixed: Play now runs a full play session (300+ consecutive
 `FLIP4` calls, user played and closed it deliberately) under its native
 MAILBOX request with zero `DEVICE_LOST` errors, in the same run
 configuration (`FLIP_TEST_GOB_REAL=1`, no overrides) that previously hung
-within the first ~300 frames at best. `FLIP_TEST_FORCE_FIFO` and
-`FLIP_TEST_TRACE_SYNC` are kept as opt-in diagnostic env vars (both
+within the first ~300 frames at best. `VK_TEGRA_DC_PRESENT_FORCE_FIFO` and
+`VK_TEGRA_DC_PRESENT_TRACE_SYNC` are kept as opt-in diagnostic env vars (both
 default off) since they were directly responsible for isolating and then
 pinpointing this bug and will likely be useful again for anything
 MAILBOX-shaped in the future.
@@ -1151,7 +1149,7 @@ windowed swapchain first and *recreate* it fullscreen on their own
 windowed -> fullscreen transition. The first (windowed) `CreateSwapchainKHR`
 now falls through to native WSI automatically; the second (fullscreen) one
 engages FLIP4 exactly as before, with zero extra plumbing needed to detect
-the transition. `FLIP_TEST_ALLOW_WINDOWED=1` overrides the gate for
+the transition. `VK_TEGRA_DC_PRESENT_ALLOW_WINDOWED=1` overrides the gate for
 testing the FLIP4 path itself against a non-fullscreen window (e.g.
 vkcube's default 500x500, used throughout the width-alignment
 investigation above) -- position will be wrong in that case, which is
@@ -1219,7 +1217,7 @@ re-tested with `vkgears -fullscreen`'s own internal 300x300 -> 2560x1600
 swapchain recreation, still engages FLIP4 tear-free on both swapchains
 with no orphaned worker thread.
 
-## Update 2026-08-18: re-testing the SGI wait ordering (FLIP_TEST_WAIT_AFTER_FLIP)
+## Update 2026-08-18: re-testing the SGI wait ordering (VK_TEGRA_DC_PRESENT_WAIT_AFTER_FLIP)
 
 Earlier in this investigation (see the "Wait for vblank HERE, right before
 FLIP4, instead of after" comment in `worker_thread_main`), moving the SGI
@@ -1229,7 +1227,7 @@ consistent mid-frame tear -- calling `FLIP4` at an arbitrary phase
 after a known vblank edge gave the driver less lead time to latch the new
 buffer before the *next* vblank.
 
-Re-tested 2026-08-18 with a new toggle, `FLIP_TEST_WAIT_AFTER_FLIP` (moves
+Re-tested 2026-08-18 with a new toggle, `VK_TEGRA_DC_PRESENT_WAIT_AFTER_FLIP` (moves
 the wait back to after `FLIP4`, the original ordering), against both
 `vkgears -fullscreen` and `~/Vulkan/build/bin/gears -f -vs`: **both stayed
 tear-free** in this session's testing, contradicting the earlier result.
@@ -1245,7 +1243,7 @@ improvement, not just a coin flip: it removes up to ~1 vblank interval
 cost of a smaller, timing-dependent margin for the deferred kernel worker
 to finish before the next vblank (versus the old ordering's guaranteed-
 maximal margin) -- which is mechanistically *why* it tore before. Flipped
-the default 2026-08-18 per direct request, with `FLIP_TEST_WAIT_AFTER_FLIP=0`
+the default 2026-08-18 per direct request, with `VK_TEGRA_DC_PRESENT_WAIT_AFTER_FLIP=0`
 kept available to revert to the more conservative before-FLIP4 ordering
 if tearing reappears under a different driver, heavier scene, or system
 load than this session's relatively short (tens of seconds per app)
@@ -1284,7 +1282,7 @@ below eliminated it too.
 MODE GATE.** `VK_PRESENT_MODE_IMMEDIATE_KHR` swapchains now fall through
 to native passthrough WSI unconditionally, the same way non-fullscreen
 windows already did -- no benefit to that app from engaging FLIP4, real
-cost from doing so anyway. `FLIP_TEST_ALLOW_IMMEDIATE=1` overrides this
+cost from doing so anyway. `VK_TEGRA_DC_PRESENT_ALLOW_IMMEDIATE=1` overrides this
 for testing the FLIP4 path itself against an IMMEDIATE-mode swapchain.
 Confirmed fixed: `gears -f` now correctly bypasses FLIP4 (log:
 "app requested VK_PRESENT_MODE_IMMEDIATE_KHR... falling through to native
@@ -1296,7 +1294,7 @@ pretty much expect the layer to not be active when vsync isn't enabled."
 
 `flatpak run tw.ddnet.ddnet` (a Flatpak-sandboxed Vulkan game, DDraceNetwork)
 crashed (SIGSEGV) shortly after launch under this layer, but ran fine for
-10+ seconds with `VK_TEGRA_X11_PRESENT_DISABLE=1` -- confirming this
+10+ seconds with `VK_TEGRA_DC_PRESENT_DISABLE=1` -- confirming this
 layer's involvement was the trigger, not a pure app-side bug that would
 crash regardless.
 
@@ -1489,7 +1487,7 @@ finds the atom or hits the root, and this runs in `CreateSwapchainKHR`
 (resize/fullscreen-toggle events), never per-frame.
 
 Debugging this added two permanent-ish diagnostics, gated behind
-`VK_TEGRA_X11_PRESENT_LOG=2` like everything else at that level:
+`VK_TEGRA_DC_PRESENT_LOG=2` like everything else at that level:
 `CreateXlibSurfaceKHR`/`CreateXcbSurfaceKHR` log the surface window's full
 ancestor chain (`_NET_WM_STATE` atom names, `override_redirect`,
 `map_state` at each level) once at creation, and
@@ -1544,7 +1542,7 @@ longer reads them):
   `FLIP_TEST_NVSYNCPT_INVALID`.
 - `FLIP_TEST_DELAY_US` (manual pre-FLIP4 timing sweep knob).
 
-`FLIP_TEST_BLOCKHEIGHT_LOG2` and `FLIP_TEST_WAIT_AFTER_FLIP` stay -- both
+`VK_TEGRA_DC_PRESENT_BLOCKHEIGHT_LOG2` and `VK_TEGRA_DC_PRESENT_WAIT_AFTER_FLIP` stay -- both
 are still-relevant tuning knobs for the one remaining content/pacing path,
 not alternate paths. The sections below documenting the investigation
 (Options 1/1b testing, the GOB tiling formula derivation, the
@@ -1655,7 +1653,7 @@ path -- broke Proton/DXVK/box64 (white screen, ~20 recreates/sec)
 
 Found via LEGO Star Wars: The Complete Saga (Steam, Proton 10.0, box64,
 DXVK): the game window opened as a blank white screen and stayed that way.
-`VK_TEGRA_X11_PRESENT_LOG_FILE=<path>` (needed because Steam redirects the
+`VK_TEGRA_DC_PRESENT_LOG_FILE=<path>` (needed because Steam redirects the
 actual game process's stdout/stderr to `/dev/null` regardless of how
 Steam itself is launched -- confirmed via `/proc/<pid>/fd/1`/`fd/2`, not
 fixable with shell redirection) showed `CreateSwapchainKHR` and
@@ -1681,7 +1679,7 @@ suboptimal and recreated it -- forever, since the layer kept giving the
 same wrong answer every time, never letting a real frame display.
 
 Fixed with `surface_wants_flip4()`, a shared helper running the identical
-fullscreen check (`detect_dc_for_window` + `FLIP_TEST_ALLOW_WINDOWED`)
+fullscreen check (`detect_dc_for_window` + `VK_TEGRA_DC_PRESENT_ALLOW_WINDOWED`)
 `CreateSwapchainKHR` itself uses. All five capability/format/present-mode/
 support query functions now run this check and forward to the real ICD
 (via `surf->icd_surface` -- never the raw wrapper handle passed straight

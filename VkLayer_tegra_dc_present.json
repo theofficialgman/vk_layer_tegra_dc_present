@@ -1,0 +1,16 @@
+{
+    "file_format_version": "1.2.0",
+    "layer": {
+        "name": "VK_LAYER_TEGRA_dc_present",
+        "type": "GLOBAL",
+        "library_path": "libVkLayer_tegra_dc_present.so",
+        "api_version": "1.1.85",
+        "implementation_version": "1",
+        "description": "Tegra L4T r32.x tear-free Vulkan present via direct TEGRA_DC_EXT_FLIP4 instead of native Vulkan WSI.",
+        "disable_environment": {
+            "VK_TEGRA_DC_PRESENT_DISABLE": "1"
+        },
+        "instance_extensions": [],
+        "device_extensions": []
+    }
+}

@@ -1,3 +1,4 @@
 *.so
 *.log
 syncpt_probe
+flatpak_install/

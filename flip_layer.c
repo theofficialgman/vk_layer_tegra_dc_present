@@ -105,7 +105,7 @@
  *
  * BYPASS
  *
- * Setting the environment variable VK_TEGRA_X11_PRESENT_DISABLE=1 turns
+ * Setting the environment variable VK_TEGRA_DC_PRESENT_DISABLE=1 turns
  * the layer into a transparent passthrough. Useful for A/B testing the
  * native WSI against the layer-redirected one.
  */
@@ -178,7 +178,7 @@
 #define __user
 #include "tegra_dc_ext.h"
 #include "gob_swizzle_spv.h"
-#define FLIP_TEST_WIN_INDEX 1
+#define DEFAULT_WIN_INDEX 1
 #define FLIP_TEST_NVSYNCPT_INVALID ((__u32)-1)
 /* ----------------------------------------------------------------------- */
 
@@ -411,9 +411,7 @@ static bool lib_load(void) {
 /* Configuration                                                           */
 /* ----------------------------------------------------------------------- */
 
-#define LAYER_NAME            "VK_LAYER_FLIP_test"
-#define LAYER_VERSION         2
-#define LAYER_DESC            "Tegra L4T r32.x Vulkan→GL X11 present relay"
+#define LAYER_NAME            "VK_LAYER_TEGRA_dc_present"
 
 /* Clamp image counts to a sane range. MIN_IMAGES is 3, not 2: empirically
  * (2026-08-17, vkgears -fullscreen, which requests 2) a 2-image swapchain
@@ -431,14 +429,14 @@ static bool lib_load(void) {
 static int g_log_level = 1;   /* 0=silent, 1=warn/err, 2=info, 3=debug */
 static FILE *g_log_fp = NULL;
 
-/* Diagnostic mode: if VK_TEGRA_X11_PRESENT_DIAG=1 is set, every QueueSubmit
+/* Diagnostic mode: if VK_TEGRA_DC_PRESENT_DIAG=1 is set, every QueueSubmit
    is followed by DeviceWaitIdle. This catches GPU faults at the offending
    submit instead of letting them propagate to a later submit returning
    DEVICE_LOST. It's catastrophically slow (every submit becomes synchronous)
    and is only meant for one-shot fault localization. */
 static bool g_diag_wait_after_submit = false;
 
-/* FLIP_TEST_TRACE_SYNC=1: log every touch of the per-image vk_render_done /
+/* VK_TEGRA_DC_PRESENT_TRACE_SYNC=1: log every touch of the per-image vk_render_done /
    gl_sample_done binary semaphores and worker_pending state, with a global
    sequence number and the calling thread's TID, so a multi-threaded app's
    actual interleaving can be reconstructed after a hang instead of guessed
@@ -461,19 +459,19 @@ static void layer_log_init(void) {
        big comment near the top of this file for the loader-deadlock
        rationale), so we can't call XInitThreads here. */
 
-    const char *lvl = getenv("VK_TEGRA_X11_PRESENT_LOG");
+    const char *lvl = getenv("VK_TEGRA_DC_PRESENT_LOG");
     if (lvl) g_log_level = atoi(lvl);
-    const char *diag = getenv("VK_TEGRA_X11_PRESENT_DIAG");
+    const char *diag = getenv("VK_TEGRA_DC_PRESENT_DIAG");
     if (diag && atoi(diag) == 1) {
         g_diag_wait_after_submit = true;
         fprintf(stderr, "[" LAYER_NAME "] DIAG MODE: DeviceWaitIdle after every submit (SLOW)\n");
     }
-    const char *trace = getenv("FLIP_TEST_TRACE_SYNC");
+    const char *trace = getenv("VK_TEGRA_DC_PRESENT_TRACE_SYNC");
     if (trace && atoi(trace) == 1) {
         g_trace_sync = true;
         fprintf(stderr, "[" LAYER_NAME "] TRACE MODE: logging every semaphore touch (VERY VERBOSE)\n");
     }
-    const char *path = getenv("VK_TEGRA_X11_PRESENT_LOG_FILE");
+    const char *path = getenv("VK_TEGRA_DC_PRESENT_LOG_FILE");
     if (path) {
         g_log_fp = fopen(path, "a");
         if (g_log_fp) setvbuf(g_log_fp, NULL, _IONBF, 0);
@@ -515,10 +513,10 @@ static void layer_log(int lvl, const char *prefix, const char *fmt, ...) {
 static bool g_layer_disabled = false;
 
 static void layer_check_disabled(void) {
-    const char *d = getenv("VK_TEGRA_X11_PRESENT_DISABLE");
+    const char *d = getenv("VK_TEGRA_DC_PRESENT_DISABLE");
     if (d && d[0] == '1') {
         g_layer_disabled = true;
-        LOG_INFO("layer disabled via VK_TEGRA_X11_PRESENT_DISABLE=1 (passthrough)");
+        LOG_INFO("layer disabled via VK_TEGRA_DC_PRESENT_DISABLE=1 (passthrough)");
     }
 }
 
@@ -1003,7 +1001,7 @@ typedef struct Swapchain {
        were already fully waited/signalled by the worker itself, and the
        resulting drop-cleanup double-signals gl_sample_done -- undefined
        behaviour, observed hanging the GPU (nvgpu channel-timeout watchdog).
-       Found 2026-08-17 via FLIP_TEST_TRACE_SYNC on the Play emulator: two
+       Found 2026-08-17 via VK_TEGRA_DC_PRESENT_TRACE_SYNC on the Play emulator: two
        earlier fixes to the acquire-side and lock-scope races only pushed
        the failure point later (8->12->9 frames) because this was the real,
        third gap. */
@@ -1012,7 +1010,7 @@ typedef struct Swapchain {
 
     /* FLIP_TEST: direct FLIP4 present backend state (no-GL version). */
     int      flip_dc_fd;
-    int      flip_win_index; /* FLIP_TEST_WIN, default FLIP_TEST_WIN_INDEX --
+    int      flip_win_index; /* VK_TEGRA_DC_PRESENT_WIN_INDEX, default DEFAULT_WIN_INDEX --
                                  see the comment where flip_dc_fd is opened */
     VkCommandPool flip_cpool;
     uint32_t flip_out_w, flip_out_h; /* clamped to fit the screen, 1:1 */
@@ -1026,7 +1024,7 @@ typedef struct Swapchain {
     VkPipelineLayout      gob_pipeline_layout;
     VkPipeline            gob_pipeline;
     VkDescriptorPool      gob_dpool;
-    long                  gob_block_height_log2; /* cached FLIP_TEST_BLOCKHEIGHT_LOG2, default 4 */
+    long                  gob_block_height_log2; /* cached VK_TEGRA_DC_PRESENT_BLOCKHEIGHT_LOG2, default 4 */
 
     pthread_mutex_t lock;
 } Swapchain;
@@ -1261,7 +1259,7 @@ static void *worker_thread_main(void *arg) {
            unlock -- an unlock-then-relock would reopen the exact window
            this is closing), means by the time any later worker_post() can
            run, this slot is already correctly "not displaceable". Found
-           2026-08-17 via FLIP_TEST_TRACE_SYNC, Play emulator -- an earlier
+           2026-08-17 via VK_TEGRA_DC_PRESENT_TRACE_SYNC, Play emulator -- an earlier
            fix (clearing at submit-issue time) only handled the mirror-image
            ordering and left this one open. */
         sc->worker_pending_sem_live = false;
@@ -1390,7 +1388,7 @@ static void *worker_thread_main(void *arg) {
                "content ready to visible" latency (see the "Wait for
                vblank HERE, right before FLIP4" comment in the branch
                below, still present and selected by
-               FLIP_TEST_WAIT_AFTER_FLIP=0, for the mechanism and history:
+               VK_TEGRA_DC_PRESENT_WAIT_AFTER_FLIP=0, for the mechanism and history:
                this exact ordering previously caused a consistent
                mid-frame tear on an earlier driver, and was moved before
                FLIP4 to fix it). Re-tested 2026-08-18 against vkgears
@@ -1398,21 +1396,21 @@ static void *worker_thread_main(void *arg) {
                was changed since the original finding, so this is
                plausibly driver-version-dependent rather than a universal
                property of the hardware/ioctl combination. Set
-               FLIP_TEST_WAIT_AFTER_FLIP=0 to revert to the more
+               VK_TEGRA_DC_PRESENT_WAIT_AFTER_FLIP=0 to revert to the more
                conservative before-FLIP4 ordering if tearing reappears
                (different driver, heavier scene, system load, etc. could
                all shrink the deferred kernel worker's margin before the
                next vblank). */
             static int wait_after_flip = -1;
             if (wait_after_flip < 0) {
-                const char *e = getenv("FLIP_TEST_WAIT_AFTER_FLIP");
+                const char *e = getenv("VK_TEGRA_DC_PRESENT_WAIT_AFTER_FLIP");
                 wait_after_flip = e ? (atoi(e) != 0 ? 1 : 0) : 1;
                 LOG_INFO("FLIP_TEST: SGI vblank wait ordering: %s",
                          wait_after_flip ? "after FLIP4 (default, lower latency)"
-                                          : "before FLIP4 (FLIP_TEST_WAIT_AFTER_FLIP=0, more conservative)");
+                                          : "before FLIP4 (VK_TEGRA_DC_PRESENT_WAIT_AFTER_FLIP=0, more conservative)");
             }
 
-            /* FLIP_TEST_WAIT_AFTER_FLIP=0 (opt-out from the 2026-08-18
+            /* VK_TEGRA_DC_PRESENT_WAIT_AFTER_FLIP=0 (opt-out from the 2026-08-18
              * default -- see the wait_after_flip comment above): wait
              * for vblank HERE, right before FLIP4, instead of after.
              * Gives the driver maximum lead time before the *next*
@@ -1426,7 +1424,7 @@ static void *worker_thread_main(void *arg) {
              * flipping at a fixed but not-vblank-aligned offset into
              * each frame interval -- which is why this wait moved
              * here in the first place. Re-test with
-             * FLIP_TEST_WAIT_AFTER_FLIP=0 if the current default
+             * VK_TEGRA_DC_PRESENT_WAIT_AFTER_FLIP=0 if the current default
              * starts tearing on some driver/scene/load combination. */
             if (!wait_after_flip &&
                 sc->glXWaitVideoSyncSGI && sc->present_mode != VK_PRESENT_MODE_IMMEDIATE_KHR) {
@@ -1457,7 +1455,7 @@ static void *worker_thread_main(void *arg) {
                not the X11 root window's -- 0,0 is only correct because
                layer_CreateSwapchainKHR's FULLSCREEN GATE already confirmed
                this window covers its target CRTC entirely (or the caller
-               explicitly opted out via FLIP_TEST_ALLOW_WINDOWED, in which
+               explicitly opted out via VK_TEGRA_DC_PRESENT_ALLOW_WINDOWED, in which
                case this is a known-wrong position, expected for that
                diagnostic use). Do not remove the gate and expect this to
                still be correct for a windowed app. */
@@ -1482,7 +1480,7 @@ static void *worker_thread_main(void *arg) {
                fullscreen glxgears, tear-free) -- required for the DC to
                interpret gob_dst_buf's content as block-linear rather than
                pitch-linear. block_height_log2 is sc->gob_block_height_log2,
-               cached from FLIP_TEST_BLOCKHEIGHT_LOG2 at swapchain creation
+               cached from VK_TEGRA_DC_PRESENT_BLOCKHEIGHT_LOG2 at swapchain creation
                (same value the gob_swizzle.comp dispatch above used). */
             win.flags |= TEGRA_DC_EXT_FLIP_FLAG_BLOCKLINEAR;
             win.block_height_log2 = (__u8)sc->gob_block_height_log2;
@@ -1518,11 +1516,11 @@ static void *worker_thread_main(void *arg) {
             if (_f4_ret < 0)
                 LOG_WARN("FLIP_TEST: FLIP4 failed: %m");
 
-            /* Default (FLIP_TEST_WAIT_AFTER_FLIP unset or 1) SGI vblank
+            /* Default (VK_TEGRA_DC_PRESENT_WAIT_AFTER_FLIP unset or 1) SGI vblank
                wait -- see the wait_after_flip comment above for why this
                is the default as of 2026-08-18 and the "Wait for vblank
                HERE, right before FLIP4" comment further up (the
-               FLIP_TEST_WAIT_AFTER_FLIP=0 path) for the more conservative
+               VK_TEGRA_DC_PRESENT_WAIT_AFTER_FLIP=0 path) for the more conservative
                alternative ordering. */
             if (wait_after_flip &&
                 sc->glXWaitVideoSyncSGI && sc->present_mode != VK_PRESENT_MODE_IMMEDIATE_KHR) {
@@ -2274,7 +2272,7 @@ static int detect_dc_for_window(Display *dpy, Window win, bool *out_is_fullscree
 }
 
 /* Runs the exact same check layer_CreateSwapchainKHR uses (FULLSCREEN GATE,
- * with the FLIP_TEST_ALLOW_WINDOWED override) to decide whether a swapchain
+ * with the VK_TEGRA_DC_PRESENT_ALLOW_WINDOWED override) to decide whether a swapchain
  * for this surface will actually get the FLIP4 treatment or fall through to
  * native passthrough WSI (fallback_to_native_swapchain).
  *
@@ -2301,7 +2299,7 @@ static bool surface_wants_flip4(Surface *s) {
     if (flip_is_fullscreen) return true;
     static int allow_windowed = -1;
     if (allow_windowed < 0) {
-        const char *e = getenv("FLIP_TEST_ALLOW_WINDOWED");
+        const char *e = getenv("VK_TEGRA_DC_PRESENT_ALLOW_WINDOWED");
         allow_windowed = (e && atoi(e) != 0) ? 1 : 0;
     }
     return allow_windowed != 0;
@@ -2738,7 +2736,7 @@ layer_CreateSwapchainKHR(VkDevice device,
        layer at all. Every app tested so far (dolphin-emu, vkgears, the Play
        emulator) already recreates its own swapchain on the windowed ->
        fullscreen transition, so this naturally engages FLIP4 at exactly the
-       right moment with no extra plumbing needed. FLIP_TEST_ALLOW_WINDOWED=1
+       right moment with no extra plumbing needed. VK_TEGRA_DC_PRESENT_ALLOW_WINDOWED=1
        overrides this for testing the FLIP4 path itself on a non-fullscreen
        window (e.g. vkcube's default 500x500) -- out_x/out_y will be wrong
        in that case, expected and fine for that specific purpose. */
@@ -2747,13 +2745,13 @@ layer_CreateSwapchainKHR(VkDevice device,
     if (!flip_is_fullscreen) {
         static int allow_windowed = -1;
         if (allow_windowed < 0) {
-            const char *e = getenv("FLIP_TEST_ALLOW_WINDOWED");
+            const char *e = getenv("VK_TEGRA_DC_PRESENT_ALLOW_WINDOWED");
             allow_windowed = (e && atoi(e) != 0) ? 1 : 0;
         }
         if (!allow_windowed) {
             LOG_INFO("CreateSwapchainKHR: window is not fullscreen on its target display; "
                      "falling through to native WSI (tearing) -- FLIP4 only engages for "
-                     "fullscreen windows, see README.md. Set FLIP_TEST_ALLOW_WINDOWED=1 to override.");
+                     "fullscreen windows, see README.md. Set VK_TEGRA_DC_PRESENT_ALLOW_WINDOWED=1 to override.");
             return fallback_to_native_swapchain(dev, device, ci, surf, pAlloc, pOut);
         }
     }
@@ -2774,25 +2772,25 @@ layer_CreateSwapchainKHR(VkDevice device,
        tearing by asking for IMMEDIATE in the first place. Falls through
        to native passthrough WSI, exactly like the fullscreen gate above,
        for the same reason: no benefit to this app from engaging FLIP4,
-       real cost from doing so anyway. FLIP_TEST_ALLOW_IMMEDIATE=1
+       real cost from doing so anyway. VK_TEGRA_DC_PRESENT_ALLOW_IMMEDIATE=1
        overrides this for testing FLIP4 against an IMMEDIATE-mode
        swapchain specifically. */
     if (ci->presentMode == VK_PRESENT_MODE_IMMEDIATE_KHR) {
         static int allow_immediate = -1;
         if (allow_immediate < 0) {
-            const char *e = getenv("FLIP_TEST_ALLOW_IMMEDIATE");
+            const char *e = getenv("VK_TEGRA_DC_PRESENT_ALLOW_IMMEDIATE");
             allow_immediate = (e && atoi(e) != 0) ? 1 : 0;
         }
         if (!allow_immediate) {
             LOG_INFO("CreateSwapchainKHR: app requested VK_PRESENT_MODE_IMMEDIATE_KHR (no "
                      "vsync, tearing accepted); falling through to native WSI -- FLIP4 has "
                      "no benefit and real per-frame overhead for an app that doesn't want "
-                     "vsync anyway, see README.md. Set FLIP_TEST_ALLOW_IMMEDIATE=1 to override.");
+                     "vsync anyway, see README.md. Set VK_TEGRA_DC_PRESENT_ALLOW_IMMEDIATE=1 to override.");
             return fallback_to_native_swapchain(dev, device, ci, surf, pAlloc, pOut);
         }
     }
 
-    /* Clamp image count to our range. FLIP_TEST_MIN_IMAGES, if set, FORCES
+    /* Clamp image count to our range. VK_TEGRA_DC_PRESENT_MIN_IMAGES, if set, FORCES
      * want to exactly that value regardless of what the app itself
      * requested via ci->minImageCount -- not just a floor that only raises
      * it. A pure floor can't actually be used to test fewer images than an
@@ -2808,10 +2806,10 @@ layer_CreateSwapchainKHR(VkDevice device,
     {
         static long force_count = -2;   /* -2 = not yet read, -1 = confirmed unset */
         if (force_count == -2) {
-            const char *e = getenv("FLIP_TEST_MIN_IMAGES");
+            const char *e = getenv("VK_TEGRA_DC_PRESENT_MIN_IMAGES");
             force_count = e ? atol(e) : -1;
             if (e && force_count < MIN_IMAGES)
-                LOG_WARN("FLIP_TEST_MIN_IMAGES=%ld is below the default safety floor "
+                LOG_WARN("VK_TEGRA_DC_PRESENT_MIN_IMAGES=%ld is below the default safety floor "
                          "of %d -- re-enabling the confirmed 2-image tearing bug on "
                          "purpose, see README.md", force_count, MIN_IMAGES);
         }
@@ -2843,13 +2841,13 @@ layer_CreateSwapchainKHR(VkDevice device,
     sc->color_space = ci->imageColorSpace;
     sc->present_mode = ci->presentMode;
     {
-        /* FLIP_TEST_FORCE_FIFO: diagnostic override to force FIFO instead
+        /* VK_TEGRA_DC_PRESENT_FORCE_FIFO: diagnostic override to force FIFO instead
            of whatever the app requested, to test whether MAILBOX's
            displaced-image semaphore bookkeeping (worker_post/QueuePresentKHR)
            is implicated in a given bug, without touching app behavior. */
         static int force_fifo = -1;
         if (force_fifo < 0) {
-            const char *e = getenv("FLIP_TEST_FORCE_FIFO");
+            const char *e = getenv("VK_TEGRA_DC_PRESENT_FORCE_FIFO");
             force_fifo = (e && atoi(e) != 0) ? 1 : 0;
         }
         if (force_fifo) sc->present_mode = VK_PRESENT_MODE_FIFO_KHR;
@@ -2958,7 +2956,7 @@ layer_CreateSwapchainKHR(VkDevice device,
      * FULLSCREEN GATE -- reuse flip_detected_dc rather than detecting
      * again) which physical output the window is on, mapped through a
      * small hardware-specific table (this SoC's fixed DSI-0->DC0 /
-     * DP-0->DC1 wiring). FLIP_TEST_DC, if set, overrides detection
+     * DP-0->DC1 wiring). VK_TEGRA_DC_PRESENT_DC_INDEX, if set, overrides detection
      * entirely (useful for forcing a specific DC while testing). Falls
      * back to 1 (the historical default) if detection fails for any
      * reason. Window ownership has only been verified on DC1 -- do not
@@ -2966,10 +2964,10 @@ layer_CreateSwapchainKHR(VkDevice device,
      * (see README). */
     int flip_dc_num;
     {
-        const char *e = getenv("FLIP_TEST_DC");
+        const char *e = getenv("VK_TEGRA_DC_PRESENT_DC_INDEX");
         if (e) {
             flip_dc_num = atoi(e);
-            LOG_INFO("FLIP_TEST: DC%d forced via FLIP_TEST_DC", flip_dc_num);
+            LOG_INFO("FLIP_TEST: DC%d forced via VK_TEGRA_DC_PRESENT_DC_INDEX", flip_dc_num);
         } else {
             flip_dc_num = flip_detected_dc;
             if (flip_dc_num < 0) {
@@ -2978,10 +2976,10 @@ layer_CreateSwapchainKHR(VkDevice device,
             }
         }
     }
-    int flip_win_index = FLIP_TEST_WIN_INDEX;
+    int flip_win_index = DEFAULT_WIN_INDEX;
     {
-        const char *e = getenv("FLIP_TEST_WIN");
-        flip_win_index = e ? atoi(e) : FLIP_TEST_WIN_INDEX;
+        const char *e = getenv("VK_TEGRA_DC_PRESENT_WIN_INDEX");
+        flip_win_index = e ? atoi(e) : DEFAULT_WIN_INDEX;
     }
     char flip_dc_path[32];
     snprintf(flip_dc_path, sizeof(flip_dc_path), "/dev/tegra_dc_%d", flip_dc_num);
@@ -3008,13 +3006,13 @@ layer_CreateSwapchainKHR(VkDevice device,
         goto fail_perimg;
     }
 
-    /* FLIP_TEST_BLOCKHEIGHT_LOG2: block_height_log2 used both for the GOB
+    /* VK_TEGRA_DC_PRESENT_BLOCKHEIGHT_LOG2: block_height_log2 used both for the GOB
      * compute shader's push constants and the FLIP4 windowattr -- see the
      * gob_block_height_log2 comment on the Swapchain struct. */
     {
         static long bhl2 = -1;
         if (bhl2 < 0) {
-            const char *e = getenv("FLIP_TEST_BLOCKHEIGHT_LOG2");
+            const char *e = getenv("VK_TEGRA_DC_PRESENT_BLOCKHEIGHT_LOG2");
             bhl2 = e ? atol(e) : 4;
         }
         sc->gob_block_height_log2 = bhl2;
