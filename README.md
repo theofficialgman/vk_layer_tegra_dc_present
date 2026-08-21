@@ -87,13 +87,19 @@ was removed)
 
 **Buffering / pacing**
 - `VK_TEGRA_DC_PRESENT_MIN_IMAGES=<N>` -- forces the swapchain image count to
-  exactly `N`, overriding both the app's own request and the built-in
-  safety floor (3, raised from 2 after "2-image swapchains are unsafe",
-  see "Update 2026-08-17"). Works in both directions: `N` above what the
-  app requests raises it for margin testing, `N` below the floor
-  (including back down to 2) deliberately re-enables the confirmed
-  2-image tearing bug on demand, e.g. to re-verify it against a specific
-  app without a source edit. Logs a warning when going below the floor.
+  exactly `N`, overriding the app's own request. By default this layer
+  has no opinion of its own about image count at all: `ci->minImageCount`
+  is used exactly as the app set it, the same as it would be without this
+  layer present (see "Update 2026-08-17" and its "Update 2026-08-21"
+  correction for the investigation that led here -- this layer used to
+  silently enforce its own floor/ceiling). This variable is purely an
+  opt-in diagnostic for deliberately testing a different count than the
+  app itself would ever request, e.g. going below the driver's real
+  minimum -- apps aren't generally built to handle a 1-image swapchain,
+  so expect app-level breakage going that low, not a layer bug. The only
+  hard limit that still applies unconditionally is a fixed-size internal
+  array capacity (`MAX_SWAPCHAIN_IMAGES`, currently 8); going over that
+  logs a warning and clamps regardless of this variable.
 - `VK_TEGRA_DC_PRESENT_FORCE_FIFO=1` -- force FIFO present mode regardless of what
   the app requests, for isolating whether a bug is specific to MAILBOX's
   displaced-image bookkeeping (see "Update 2026-08-17 part 3").
@@ -1724,5 +1730,74 @@ the log going from a continuous recreate storm to exactly one
 windowed-at-launch -> fullscreen-once-the-WM-catches-up transition,
 exactly the pattern already relied on for every other app in this
 project).
+
+## Update 2026-08-21: correction to "Update 2026-08-17: 2-image swapchains
+are unsafe" -- the MIN_IMAGES/MAX_IMAGES floor and ceiling are gone
+
+While debugging a swapchain image count mismatch with an app that expects
+`minImageCount=2` (using a standalone diagnostic layer built for the
+occasion, see `../swapchain_probe/`), that debugging surfaced a separate,
+real bug: `layer_GetPhysicalDeviceSurfaceCapabilitiesKHR` was reporting
+`MIN_IMAGES` (then 3) as the surface's minimum image count instead of the
+real driver's own answer (confirmed via the probe layer to be 2) --
+harmless to this layer's own behavior since `CreateSwapchainKHR`'s
+internal floor used the same constant, but misleading to anything
+inspecting capabilities from outside, and it meant a compliant app was
+being told to request >= 3 when the real hardware only required 2. Fixed
+to report the real driver's minImageCount/maxImageCount here, independent
+of whatever MIN_IMAGES currently was.
+
+Fixing that surfaced the original question again: is `MIN_IMAGES=3` (see
+"Update 2026-08-17" above) still actually necessary? Retested directly:
+edited `MIN_IMAGES` back to 2, rebuilt, ran real workloads -- no tearing.
+The 2026-08-17 finding is now believed to have been a symptom of a
+since-fixed request/allocation mismatch bug elsewhere in this layer (the
+app believing it had been given N images while actually fewer were
+allocated) rather than an inherent timing/margin problem with 2-image
+swapchains on this hardware -- this layer has changed substantially since
+2026-08-17 (MAILBOX displaced-image race fixes, swapchain tombstoning,
+the `surface_wants_flip4` decision-caching fix, and others), any one of
+which could plausibly have been the real fix without anyone having
+connected it back to the 2026-08-17 tearing report at the time. Not
+independently re-root-caused at the kernel-timing level; this is a
+retest-confirmed reversal, not a new explanation for the old symptom.
+
+Once the floor was confirmed unnecessary, removed the `MIN_IMAGES` and
+`MAX_IMAGES` constants entirely rather than leaving them at the driver's
+current values (2/8) as new hardcoded numbers -- those are just what
+*this* driver happens to report today, not something to bake back in as
+a fresh policy. First pass: `layer_CreateSwapchainKHR` queried the real
+driver's `GetPhysicalDeviceSurfaceCapabilitiesKHR` directly and clamped
+`want` against its actual minImageCount/maxImageCount. On reflection that
+was still this layer inserting itself into a negotiation it has no need
+to be part of -- the app already sees the real driver's own capabilities
+(the fix above), so whatever it then puts in `ci->minImageCount` is
+already the outcome of that negotiation; re-clamping it here a second
+time against the same driver values is redundant at best. Removed that
+clamp too: `ci->minImageCount` is now used exactly as given, same as
+without this layer, full stop. `VK_TEGRA_DC_PRESENT_MIN_IMAGES` remains
+as a purely opt-in override for deliberately testing a count the app
+itself would never request; it no longer warns about the driver's
+minimum since the driver isn't consulted here anymore, only about the
+one remaining hard limit below.
+
+One constant remains, renamed to `MAX_SWAPCHAIN_IMAGES`: `images[]` in
+the `Swapchain` struct is a fixed-size C array, so *some* hard compile-
+time cap has to exist regardless of what any driver reports or what an
+app requests -- this one is a pure memory-safety bound, never reported to
+an app as if it were the driver's own answer, and it's the only thing
+that still clamps `want` (with a warning) even when
+`VK_TEGRA_DC_PRESENT_MIN_IMAGES` is set. Descriptor pool sizing
+(`create_gob_pipeline`), which previously also used the old `MAX_IMAGES`
+constant as a blanket capacity, now sizes to `sc->image_count`, the
+swapchain's actual resolved count.
+
+Verified via the diagnostic probe layer: with no override set, the
+app's requested count passes straight through to the actual allocated
+count, matching what happens without this layer. Also re-verified
+`VK_TEGRA_DC_PRESENT_MIN_IMAGES` forcing a value as low as 1, which
+breaks the *app* (confirmed via vkcube's own
+`demo_draw: Assertion '!err' failed`) -- an app-level consequence of
+deliberately testing an unrealistic value, not a layer bug.
 
 </details>

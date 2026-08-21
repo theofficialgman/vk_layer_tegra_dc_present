@@ -413,14 +413,24 @@ static bool lib_load(void) {
 
 #define LAYER_NAME            "VK_LAYER_TEGRA_dc_present"
 
-/* Clamp image counts to a sane range. MIN_IMAGES is 3, not 2: empirically
- * (2026-08-17, vkgears -fullscreen, which requests 2) a 2-image swapchain
- * ties buffer reuse to a ~33ms/2-vblank gap, which isn't enough margin for
- * FLIP4's deferred kthread-queued flip to reliably finish before we start
- * overwriting that slot again, causing a real recurring tear. 3 images
- * (~50ms/3-vblank gap) fixed it with no other change. See README.md. */
-#define MIN_IMAGES   3
-#define MAX_IMAGES   8
+/* Hard technical cap on how many images a single swapchain can have --
+ * PerImage images[] in the Swapchain struct below is a fixed-size array,
+ * so this is a genuine implementation limit, unrelated to the real
+ * driver's own minImageCount/maxImageCount. Those are queried fresh and
+ * used directly wherever they matter (see
+ * layer_GetPhysicalDeviceSurfaceCapabilitiesKHR and the image-count
+ * clamp in layer_CreateSwapchainKHR) rather than being hardcoded here.
+ *
+ * There used to be a MIN_IMAGES "safety floor" constant too (3, then 2,
+ * see README.md "Update 2026-08-17" and its "Update 2026-08-21"
+ * correction) that silently raised every swapchain's image count above
+ * what both the app requested and the driver actually required. Removed
+ * 2026-08-21: once the capability query was fixed to stop reporting that
+ * floor as if it were the driver's own minimum (same update), the floor
+ * itself no longer served a purpose distinct from just clamping against
+ * the driver's real minImageCount, which layer_CreateSwapchainKHR now
+ * does directly. */
+#define MAX_SWAPCHAIN_IMAGES   8
 
 /* ----------------------------------------------------------------------- */
 /* Logging                                                                 */
@@ -733,6 +743,22 @@ static void inst_remove(void *key) {
     pthread_mutex_unlock(&g_inst_lock);
 }
 
+/* Returns any one tracked InstNode, for call sites that only have a
+ * VkPhysicalDevice/VkDevice (no VkInstance) but need the instance-level
+ * dispatch table -- e.g. to call GetPhysicalDeviceSurfaceCapabilitiesKHR
+ * from inside CreateDevice/CreateSwapchainKHR. We don't track which
+ * instance owns which physical device, so this just takes the first
+ * entry in the table. Brittle for multi-instance apps but matches our
+ * actual use. */
+static InstNode *any_inst(void) {
+    InstNode *in = NULL;
+    pthread_mutex_lock(&g_inst_lock);
+    for (int b = 0; b < HASH_BUCKETS && !in; b++)
+        for (InstNode *n = g_inst_table[b]; n; n = n->next) { in = n; break; }
+    pthread_mutex_unlock(&g_inst_lock);
+    return in;
+}
+
 static DevNode *dev_lookup(void *key) {
     pthread_mutex_lock(&g_dev_lock);
     DevNode *n = g_dev_table[bucket(key)];
@@ -927,7 +953,7 @@ typedef struct Swapchain {
        are valid at creation time but the GPU faults on use. */
     VkImageUsageFlags image_usage;
 
-    PerImage      images[MAX_IMAGES];
+    PerImage      images[MAX_SWAPCHAIN_IMAGES];
 
     /* X / GLX resources owned by this swapchain.
 
@@ -1868,13 +1894,17 @@ static bool create_gob_pipeline(DevNode *dev, Swapchain *sc) {
     d->DestroyShaderModule(dev->device, shader, NULL); /* not needed after pipeline creation */
     if (pr != VK_SUCCESS) return false;
 
+    /* Sized to sc->image_count (the actual number of images this
+     * swapchain has, already resolved by the time create_gob_pipeline
+     * runs), not the fixed array-capacity cap -- no need to reserve
+     * descriptors for image slots that don't exist. */
     VkDescriptorPoolSize sizes[2] = {0};
     sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    sizes[0].descriptorCount = MAX_IMAGES;
+    sizes[0].descriptorCount = sc->image_count;
     sizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    sizes[1].descriptorCount = MAX_IMAGES;
+    sizes[1].descriptorCount = sc->image_count;
     VkDescriptorPoolCreateInfo dpci = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    dpci.maxSets = MAX_IMAGES;
+    dpci.maxSets = sc->image_count;
     dpci.poolSizeCount = 2;
     dpci.pPoolSizes = sizes;
     if (d->CreateDescriptorPool(dev->device, &dpci, NULL, &sc->gob_dpool) != VK_SUCCESS)
@@ -2518,8 +2548,20 @@ layer_GetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice physicalDevice,
     }
     uint32_t w = 0, h = 0; window_size(s, &w, &h);
     debug_log_fullscreen_sample(s);
-    pCaps->minImageCount = MIN_IMAGES;
-    pCaps->maxImageCount = MAX_IMAGES;
+    /* minImageCount/maxImageCount always come from the real driver -- this
+     * layer has no synthetic policy value for either anymore (see the
+     * MAX_SWAPCHAIN_IMAGES comment near the top of this file). If we
+     * can't reach the real ICD's own answer, propagate that failure
+     * rather than fabricate a number; there's no principled synthetic
+     * value left to invent. */
+    VkSurfaceCapabilitiesKHR real_caps = {0};
+    InstNode *in = inst_lookup(dispatch_key(physicalDevice));
+    if (!s->icd_surface || !in || !in->d.GetPhysicalDeviceSurfaceCapabilitiesKHR)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    VkResult real_r = in->d.GetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice, s->icd_surface, &real_caps);
+    if (real_r != VK_SUCCESS) return real_r;
+    pCaps->minImageCount = real_caps.minImageCount;
+    pCaps->maxImageCount = real_caps.maxImageCount;
     pCaps->currentExtent.width  = w ? w : 1;
     pCaps->currentExtent.height = h ? h : 1;
     pCaps->minImageExtent.width  = 1;
@@ -2850,17 +2892,20 @@ layer_CreateSwapchainKHR(VkDevice device,
         }
     }
 
-    /* Clamp image count to our range. VK_TEGRA_DC_PRESENT_MIN_IMAGES, if set, FORCES
-     * want to exactly that value regardless of what the app itself
-     * requested via ci->minImageCount -- not just a floor that only raises
-     * it. A pure floor can't actually be used to test fewer images than an
-     * app already requests on its own (e.g. vkgears now requests 3 by
-     * default, matching MIN_IMAGES, so a floor override has nothing left
-     * to lower) -- an exact force is what's needed to deliberately re-test
-     * below the default safety floor (MIN_IMAGES=3, raised from 2 after
-     * "2-image swapchains are unsafe", see README.md, Update 2026-08-17)
-     * on demand, without a source edit, against whichever app you want to
-     * point it at. */
+    /* No layer-side opinion about image count at all -- this layer
+     * doesn't clamp or renegotiate ci->minImageCount against anything.
+     * The app already saw the real driver's own minImageCount/
+     * maxImageCount from layer_GetPhysicalDeviceSurfaceCapabilitiesKHR
+     * before deciding what to request here, exactly as it would without
+     * this layer present; we just honor that decision, the same as a
+     * real ICD's CreateSwapchainKHR would. See README.md, "Update
+     * 2026-08-21", for the investigation that led here (this layer used
+     * to enforce its own MIN_IMAGES/MAX_IMAGES floor and ceiling).
+     *
+     * VK_TEGRA_DC_PRESENT_MIN_IMAGES remains as an explicit, opt-in
+     * override for deliberately testing a different count than the app
+     * itself would ever request -- forces want to exactly that value.
+     * Not part of "normal" behavior; only applies if you set it. */
     uint32_t want = ci->minImageCount;
     LOG_INFO("CreateSwapchainKHR: app requested minImageCount=%u", ci->minImageCount);
     {
@@ -2868,15 +2913,19 @@ layer_CreateSwapchainKHR(VkDevice device,
         if (force_count == -2) {
             const char *e = getenv("VK_TEGRA_DC_PRESENT_MIN_IMAGES");
             force_count = e ? atol(e) : -1;
-            if (e && force_count < MIN_IMAGES)
-                LOG_WARN("VK_TEGRA_DC_PRESENT_MIN_IMAGES=%ld is below the default safety floor "
-                         "of %d -- re-enabling the confirmed 2-image tearing bug on "
-                         "purpose, see README.md", force_count, MIN_IMAGES);
         }
         if (force_count >= 0) want = (uint32_t)force_count;
-        else if (want < MIN_IMAGES) want = MIN_IMAGES;
     }
-    if (want > MAX_IMAGES) want = MAX_IMAGES;
+    /* The one unavoidable exception: images[] below is a fixed-size
+     * array, so this is a hard memory-safety bound, not a policy choice
+     * -- see MAX_SWAPCHAIN_IMAGES's own comment near the top of this
+     * file. Applies even to an explicit VK_TEGRA_DC_PRESENT_MIN_IMAGES
+     * override; there's no way to honor a request past it. */
+    if (want > MAX_SWAPCHAIN_IMAGES) {
+        LOG_WARN("CreateSwapchainKHR: minImageCount=%u exceeds this layer's hard cap of %d, "
+                 "clamping -- see README.md", want, MAX_SWAPCHAIN_IMAGES);
+        want = MAX_SWAPCHAIN_IMAGES;
+    }
 
     /* Reject formats we don't support. */
     switch (ci->imageFormat) {
@@ -4000,11 +4049,7 @@ layer_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInfo *ci,
        extensions the driver doesn't support and from crashing on missing
        entrypoints. */
     {
-        InstNode *inst_hint = NULL;
-        pthread_mutex_lock(&g_inst_lock);
-        for (int b = 0; b < HASH_BUCKETS && !inst_hint; b++)
-            for (InstNode *n = g_inst_table[b]; n; n = n->next) { inst_hint = n; break; }
-        pthread_mutex_unlock(&g_inst_lock);
+        InstNode *inst_hint = any_inst();
 
         if (inst_hint && inst_hint->d.GetPhysicalDeviceProperties) {
             VkPhysicalDeviceProperties props = {0};
@@ -4083,14 +4128,7 @@ layer_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInfo *ci,
         return r;
     }
 
-    InstNode *in = NULL;
-    /* Find the instance whose physical device list contains 'phys'. We don't
-       track that explicitly; just take the only instance in our table.
-       This is brittle for multi-instance apps but matches our actual use. */
-    pthread_mutex_lock(&g_inst_lock);
-    for (int b = 0; b < HASH_BUCKETS && !in; b++)
-        for (InstNode *n = g_inst_table[b]; n; n = n->next) { in = n; break; }
-    pthread_mutex_unlock(&g_inst_lock);
+    InstNode *in = any_inst();
 
     DevNode *node = calloc(1, sizeof(*node));
     if (!node) return VK_ERROR_OUT_OF_HOST_MEMORY;
