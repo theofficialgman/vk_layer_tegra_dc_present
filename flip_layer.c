@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  *
- * Copyright (C) 2026 gavin_darkglider
  * Copyright (C) 2026 theofficialgman
+ * Copyright (C) 2026 gavin_darkglider
  * Copyright (C) 2026 Anthropic (Claude AI assistant contributions)
  *
  * This program is free software; you can redistribute it and/or modify
@@ -21,7 +21,7 @@
  */
 
 /*
- * vk_layer_tegra_x11_present.c
+ * flip_layer.c
  *
  * Vulkan implicit layer for NVIDIA Tegra L4T r32.x that fixes the broken
  * Vulkan-on-X11 present path by presenting directly through the display

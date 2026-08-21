@@ -1,22 +1,42 @@
-# FLIP4 present prototype — SOLVED (see "Update 2026-08-16 part 3" at the bottom)
+# VK_LAYER_TEGRA_dc_present
 
-Standalone Vulkan explicit layer that swaps the GL/GLX `glXSwapBuffers` present
-step (from the real `vk_layer_tegra_x11_present.c`) for a direct
-`TEGRA_DC_EXT_FLIP4` ioctl call on the display controller, to test whether
-presenting real, GPU-fenced Vulkan-rendered content this way avoids the
-tearing that native `vkQueuePresentKHR` exhibits on this driver.
+Vulkan implicit layer for NVIDIA Tegra L4T r32.x that fixes tearing in
+Vulkan-on-X11 presentation. On this platform the Vulkan ICD's native WSI
+implementation does not produce vsync-locked presentation -- frames tear,
+a known driver-side issue with no fix available from NVIDIA (the BSP is
+EOL'd). This layer works around it by bypassing Vulkan WSI's own present
+path entirely and presenting directly through the display controller's
+`TEGRA_DC_EXT_FLIP4` ioctl -- the same low-level mechanism NVIDIA's own
+drivers use -- instead.
 
-It started as a copy of the real layer with the final present step replaced,
-and was later stripped of the GL rendering/fallback infrastructure entirely
-(no `gl_import_image`, no shader/blit program, no GL fallback path) once the
-investigation concluded and the pure-Vulkan path was confirmed working —
-this file now has no GL rendering code at all, only the minimal GLX context
-kept alive for `glXWaitVideoSyncSGI` timing. Setup failures (opening the DC
-device, claiming the window, missing `GLX_SGI_video_sync`, etc.) are hard
-failures, not silent degradation to a different presentation mechanism —
-appropriate for a focused test of one specific thing, not how the real
-production layer should behave. Not integrated with the real layer; runs
-standalone via explicit layer activation, no system install.
+Pure Vulkan in the data path: application rendering is untouched, and
+presentation is a GPU-side compute shader that converts the rendered
+image into the display controller's native block-linear (GOB) tiling
+layout, exported as a dma-buf and handed to `FLIP4` directly. No GL
+rendering, no GL/GLX interop, no CPU readback anywhere in the pipeline.
+
+**Status: production-ready.** Confirmed tear-free and stable across a
+range of real applications -- vkcube/vkgears, DDNet, dolphin-emu, the
+Play emulator, and Proton/DXVK/box64 (LEGO Star Wars: The Complete Saga)
+-- see "Final architecture" and "Bugs found and fixed" below for what
+that covers.
+
+**When it engages:** only for swapchains on fullscreen windows using
+FIFO, FIFO_RELAXED, or MAILBOX present modes. Windowed swapchains and
+`VK_PRESENT_MODE_IMMEDIATE_KHR` fall through untouched to native Vulkan
+WSI (tearing, same as without this layer). FLIP4 presents via a raw
+hardware overlay plane that ignores X11 window stacking, so it's only
+correct when a window covers its target display exactly; IMMEDIATE mode
+already accepts tearing on its own, so there's no tearing benefit to
+engaging FLIP4 for it, only real per-frame overhead. See the
+`VK_TEGRA_DC_PRESENT_ALLOW_WINDOWED`/`_ALLOW_IMMEDIATE` overrides below
+if you need to test the FLIP4 path itself against either.
+
+**Install:** `make install` builds and installs the `.so` and the
+implicit-layer JSON system-wide, active by default with an opt-out via
+`VK_TEGRA_DC_PRESENT_DISABLE` (see below). See "Build & run" further down
+for ad-hoc/explicit-layer use without installing.
+
 
 ## Environment variable reference
 
@@ -94,64 +114,6 @@ was removed)
   MAILBOX displaced-image race (see "Update 2026-08-17 part 3") by
   reconstructing real interleaving instead of guessing from code reading.
   Very verbose -- one line per semaphore touch, every frame.
-
-## ⚠️ Superseded 2026-08-16 — see "Update" section below
-
-The result and conclusion immediately below (originally titled "the hypothesis
-is disproven") held for every test run through this prototype's LINEAR
-detile-target architecture. It does **not** hold universally: a later test
-using a `BLOCKLINEAR`-flagged buffer instead of `LINEAR` showed no detectable
-tearing under a causally-isolated test, directly contradicting "FLIP4 itself
-does not provide buffer-swap atomicity." The correct, narrower statement is
-**"FLIP4 over a LINEAR-tiled buffer lacks atomicity on this hardware; FLIP4
-over a BLOCKLINEAR-tiled buffer, matching NVIDIA's own tiling choice, does
-not tear in testing."** Read the original result below for the LINEAR-path
-evidence (still valid on its own terms), then read "Update 2026-08-16" for
-what changed and why it's not yet a usable fix.
-
-## Original result (LINEAR path only): FLIP4 tears too.
-
-This version is **fully working and pure Vulkan** — no GL at all in the data
-path (see "Final architecture" below) — and correctly:
-- Presents at the right screen position, right orientation, fully opaque.
-- Paces to real vsync (confirmed ~60fps, not free-running).
-- Was tested with the `FLIP4` call reordered to fire at the same ideal
-  timing phase (right after vblank, maximum lead time before the next one)
-  that native Vulkan's own presentation appears to use.
-
-**It still tears — at the same screen position/phase as native, unlayered
-Vulkan presentation**, confirmed visually in both windowed and fullscreen
-(2560x1600) modes.
-
-Conclusion: `TEGRA_DC_EXT_FLIP4` itself does not provide the buffer-swap
-atomicity that makes GL's own presentation tear-free on this driver, even
-called about as correctly as it can be (real Vulkan-rendered content,
-correct GPU fencing, correct format/geometry, vblank-aligned timing, no
-scheduling primitive left untried — `tegra_dc_ext_flip_windowattr.timestamp`
-was checked and is not a "schedule for exact future vblank" mechanism the
-way `GLX_OML_sync_control`'s `target_msc` is; it's bookkeeping for
-skipping/coalescing already-queued flips within one vsync window, nothing
-more). This closes the loop on an earlier finding in the investigation that
-led to this prototype: GL's own presentation was independently confirmed
-(via kernel `dev_info` instrumentation) to **never call `FLIP4` at all**
-when uncomposited. Put together: GL doesn't tear and doesn't use `FLIP4`;
-we used `FLIP4` carefully and it tears anyway. Whatever gives GL's swap its
-atomicity on this driver is something else entirely, inside NVIDIA's closed
-GLX implementation, with no equivalent on the open `tegra_dc_ext` ioctl
-surface available to userspace.
-
-**Practical upshot for the actual project (as of this original result):**
-this validates the existing GL/GLX bridge (`vk_layer_tegra_x11_present.c`)
-as the right architecture, not a workaround standing in for a simpler fix
-that was just waiting to be found — for the `LINEAR`-tiled path tested here.
-**This was later found to be wrong — see "Update 2026-08-16 part 3" at the
-bottom of this file.** A `BLOCKLINEAR`-tiled `FLIP4` target, fed real
-content through a compute shader implementing the reverse-engineered GOB
-tiling formula, presents correctly and tear-free, fullscreen, uncomposited,
-with no GL/GLX bridge involved at all. The GL/GLX bridge is no longer the
-only known working option — it's a real, working *alternative* now, with
-its own tradeoffs (portability/robustness vs. this path's driver-version-
-specific reverse-engineered constants) rather than the sole fix.
 
 ## Final architecture (pure Vulkan, no GL in the data path)
 
@@ -264,6 +226,67 @@ Safety notes if you're poking at this again:
 - Compositor (KWin) should be off for a clean test —
   `qdbus org.kde.KWin /Compositor org.kde.kwin.Compositing.active` should
   say `false`; `xprop -root -notype _NET_WM_CM_S0` should say "not found".
+
+<details>
+<summary><strong>Full investigative history (2026-08-16 &rarr; 2026-08-19)</strong> -- how this was discovered, dead ends included</summary>
+
+## ⚠️ Superseded 2026-08-16 — see "Update" section below
+
+The result and conclusion immediately below (originally titled "the hypothesis
+is disproven") held for every test run through this prototype's LINEAR
+detile-target architecture. It does **not** hold universally: a later test
+using a `BLOCKLINEAR`-flagged buffer instead of `LINEAR` showed no detectable
+tearing under a causally-isolated test, directly contradicting "FLIP4 itself
+does not provide buffer-swap atomicity." The correct, narrower statement is
+**"FLIP4 over a LINEAR-tiled buffer lacks atomicity on this hardware; FLIP4
+over a BLOCKLINEAR-tiled buffer, matching NVIDIA's own tiling choice, does
+not tear in testing."** Read the original result below for the LINEAR-path
+evidence (still valid on its own terms), then read "Update 2026-08-16" for
+what changed and why it's not yet a usable fix.
+
+## Original result (LINEAR path only): FLIP4 tears too.
+
+This version is **fully working and pure Vulkan** — no GL at all in the data
+path (see "Final architecture" below) — and correctly:
+- Presents at the right screen position, right orientation, fully opaque.
+- Paces to real vsync (confirmed ~60fps, not free-running).
+- Was tested with the `FLIP4` call reordered to fire at the same ideal
+  timing phase (right after vblank, maximum lead time before the next one)
+  that native Vulkan's own presentation appears to use.
+
+**It still tears — at the same screen position/phase as native, unlayered
+Vulkan presentation**, confirmed visually in both windowed and fullscreen
+(2560x1600) modes.
+
+Conclusion: `TEGRA_DC_EXT_FLIP4` itself does not provide the buffer-swap
+atomicity that makes GL's own presentation tear-free on this driver, even
+called about as correctly as it can be (real Vulkan-rendered content,
+correct GPU fencing, correct format/geometry, vblank-aligned timing, no
+scheduling primitive left untried — `tegra_dc_ext_flip_windowattr.timestamp`
+was checked and is not a "schedule for exact future vblank" mechanism the
+way `GLX_OML_sync_control`'s `target_msc` is; it's bookkeeping for
+skipping/coalescing already-queued flips within one vsync window, nothing
+more). This closes the loop on an earlier finding in the investigation that
+led to this prototype: GL's own presentation was independently confirmed
+(via kernel `dev_info` instrumentation) to **never call `FLIP4` at all**
+when uncomposited. Put together: GL doesn't tear and doesn't use `FLIP4`;
+we used `FLIP4` carefully and it tears anyway. Whatever gives GL's swap its
+atomicity on this driver is something else entirely, inside NVIDIA's closed
+GLX implementation, with no equivalent on the open `tegra_dc_ext` ioctl
+surface available to userspace.
+
+**Practical upshot for the actual project (as of this original result):**
+this validates the existing GL/GLX bridge (`vk_layer_tegra_x11_present.c`)
+as the right architecture, not a workaround standing in for a simpler fix
+that was just waiting to be found — for the `LINEAR`-tiled path tested here.
+**This was later found to be wrong — see "Update 2026-08-16 part 3" at the
+bottom of this file.** A `BLOCKLINEAR`-tiled `FLIP4` target, fed real
+content through a compute shader implementing the reverse-engineered GOB
+tiling formula, presents correctly and tear-free, fullscreen, uncomposited,
+with no GL/GLX bridge involved at all. The GL/GLX bridge is no longer the
+only known working option — it's a real, working *alternative* now, with
+its own tradeoffs (portability/robustness vs. this path's driver-version-
+specific reverse-engineered constants) rather than the sole fix.
 
 ## Option 1 / 1b: ruling out software wait jitter as the cause
 
@@ -1701,3 +1724,5 @@ the log going from a continuous recreate storm to exactly one
 windowed-at-launch -> fullscreen-once-the-WM-catches-up transition,
 exactly the pattern already relied on for every other app in this
 project).
+
+</details>
