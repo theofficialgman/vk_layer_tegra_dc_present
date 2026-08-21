@@ -823,6 +823,14 @@ typedef struct Surface {
        stop after 10s without a separate polling thread. */
     struct timespec debug_create_time;
     struct timespec debug_last_log_time;
+    /* Cached outcome of the most recent CreateSwapchainKHR gate decision
+       for this surface (FLIP4 vs. fallback_to_native_swapchain) -- see
+       surface_wants_flip4()'s comment for why capability/format/present-
+       mode queries must answer from this cache instead of re-running the
+       live gate checks on every call. sc_decision_valid is false only
+       before this surface's first swapchain has ever been created. */
+    bool sc_decision_valid;
+    bool sc_wants_flip4;
 } Surface;
 
 #define SURFACE_MAGIC 0x53524654594c5253ULL  /* "SRFTYLSR" backwards-ish */
@@ -2276,14 +2284,17 @@ static int detect_dc_for_window(Display *dpy, Window win, bool *out_is_fullscree
     return result;
 }
 
-/* Runs the exact same check layer_CreateSwapchainKHR uses (FULLSCREEN GATE,
- * with the VK_TEGRA_DC_PRESENT_ALLOW_WINDOWED override) to decide whether a swapchain
- * for this surface will actually get the FLIP4 treatment or fall through to
- * native passthrough WSI (fallback_to_native_swapchain).
+/* Reports whether a swapchain for this surface will get the FLIP4
+ * treatment or fall through to native passthrough WSI
+ * (fallback_to_native_swapchain) -- whichever of those
+ * layer_CreateSwapchainKHR's own gates (FULLSCREEN, IMMEDIATE MODE,
+ * unsupported format, etc.) actually decided the last time a swapchain
+ * was created for this surface.
  *
  * Surface capability/format/present-mode queries MUST answer with
- * whichever of those two a real CreateSwapchainKHR call will actually take
- * -- not unconditionally with this layer's own synthetic values. Confirmed
+ * whichever of those two the surface's CURRENT (or most recently alive)
+ * swapchain actually took -- not unconditionally with this layer's own
+ * synthetic values, and not with a fresh live re-check either. Confirmed
  * 2026-08-19: DXVK (Proton/box64, LEGO Star Wars: The Complete Saga) got
  * this layer's synthetic capabilities/formats/present-modes for a window
  * that (at that exact query moment, before the WM had caught up) wasn't
@@ -2292,13 +2303,39 @@ static int detect_dc_for_window(Display *dpy, Window win, bool *out_is_fullscree
  * capabilities the real ICD never actually reported. The result was a
  * continuous ~20 recreates/second storm (self-consistency check failing
  * every single frame) and a blank white window -- confirmed absent
- * entirely without this layer loaded at all. Query functions now run this
- * same check and forward to the real ICD (via surf->icd_surface, never the
- * raw wrapper handle -- see fallback_to_native_swapchain's comment for why
- * that specific mistake previously caused a SIGSEGV) whenever native WSI
- * is what will actually get used, so whichever path CreateSwapchainKHR
- * takes, the app was already told the truth about it. */
+ * entirely without this layer loaded at all.
+ *
+ * A live re-check on every call (the first fix for the bug above) isn't
+ * right either: window/display state can legitimately change between
+ * when a swapchain was created and when the app later re-queries
+ * capabilities against that SAME still-live swapchain (e.g. DXVK's own
+ * ongoing staleness checks), and answering from a fresh poll at that
+ * point would describe a hypothetical new swapchain instead of the real
+ * one the app is still holding -- reproducing the identical class of bug
+ * in the opposite direction. So the decision is cached on the Surface
+ * (sc_decision_valid/sc_wants_flip4) at the exact moment
+ * layer_CreateSwapchainKHR itself commits to one path or the other (see
+ * the two writers: fallback_to_native_swapchain() and the FLIP4 success
+ * path's `track_swapchain(sc)` call), and reused here until the next
+ * CreateSwapchainKHR call for this surface overwrites it -- deliberately
+ * left sticky across a DestroySwapchainKHR with nothing yet recreated in
+ * its place, since a stale-but-plausible answer in that narrow gap is
+ * harmless (nothing live to be inconsistent against) and a fresh live
+ * poll there could just as easily be wrong by the time the next
+ * swapchain actually gets created.
+ *
+ * Only before this surface's very first swapchain (sc_decision_valid ==
+ * false) is there no prior decision to reuse, so this falls back to the
+ * same live FULLSCREEN GATE check layer_CreateSwapchainKHR itself runs at
+ * that same, first, moment -- guaranteed to agree since it's the same
+ * window state observed at essentially the same instant.
+ *
+ * Whichever path applies, query functions forward to the real ICD (via
+ * surf->icd_surface, never the raw wrapper handle -- see
+ * fallback_to_native_swapchain's comment for why that specific mistake
+ * previously caused a SIGSEGV) whenever native WSI is what's in play. */
 static bool surface_wants_flip4(Surface *s) {
+    if (s->sc_decision_valid) return s->sc_wants_flip4;
     bool flip_is_fullscreen = false;
     detect_dc_for_window(s->dpy, s->window, &flip_is_fullscreen);
     if (flip_is_fullscreen) return true;
@@ -2636,12 +2673,23 @@ static VkResult fallback_to_native_swapchain(DevNode *dev, VkDevice device,
                                              Surface *surf,
                                              const VkAllocationCallbacks *pAlloc,
                                              VkSwapchainKHR *pOut) {
+    VkResult r;
     if (surf && surf->icd_surface) {
         VkSwapchainCreateInfoKHR modci = *ci;
         modci.surface = surf->icd_surface;
-        return dev->d.CreateSwapchainKHR(device, &modci, pAlloc, pOut);
+        r = dev->d.CreateSwapchainKHR(device, &modci, pAlloc, pOut);
+    } else {
+        r = dev->d.CreateSwapchainKHR(device, ci, pAlloc, pOut);
     }
-    return dev->d.CreateSwapchainKHR(device, ci, pAlloc, pOut);
+    /* Record the decision for surface_wants_flip4() -- but only once a
+       swapchain has actually been committed to this surface; a failed
+       CreateSwapchainKHR here didn't produce one, so leave any prior
+       decision (or the no-decision-yet default) alone. */
+    if (surf && (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR)) {
+        surf->sc_decision_valid = true;
+        surf->sc_wants_flip4 = false;
+    }
+    return r;
 }
 
 VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL
@@ -2705,7 +2753,14 @@ layer_CreateSwapchainKHR(VkDevice device,
         PFN_vkCreateSwapchainKHR icd_fn = (PFN_vkCreateSwapchainKHR)
             dev->d.GetDeviceProcAddr(device, "vkCreateSwapchainKHR");
         if (!icd_fn) return VK_ERROR_INITIALIZATION_FAILED;
-        return icd_fn(device, &modci, pAlloc, pOut);
+        VkResult r = icd_fn(device, &modci, pAlloc, pOut);
+        /* Same decision-cache bookkeeping as fallback_to_native_swapchain()
+           -- a passthrough device never takes the FLIP4 path either. */
+        if (surf && (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR)) {
+            surf->sc_decision_valid = true;
+            surf->sc_wants_flip4 = false;
+        }
+        return r;
     }
 
     if (g_layer_disabled || !surf)
@@ -3078,6 +3133,9 @@ layer_CreateSwapchainKHR(VkDevice device,
     }
 
     track_swapchain(sc);
+
+    surf->sc_decision_valid = true;
+    surf->sc_wants_flip4 = true;
 
     *pOut = (VkSwapchainKHR)(uintptr_t)sc;
     LOG_INFO("CreateSwapchainKHR -> sc=%p %ux%u fmt=%d images=%u present_mode=%d (async worker)",
