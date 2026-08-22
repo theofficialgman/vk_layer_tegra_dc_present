@@ -2784,6 +2784,20 @@ layer_CreateSwapchainKHR(VkDevice device,
 
     Surface *surf = as_surface(ci->surface);
 
+    /* Set when the DC device or hardware overlay window itself turns out to
+     * be unavailable (already claimed by another process -- another
+     * fullscreen app, most likely) rather than some other setup failure.
+     * This is a distinct failure class from everything else in this
+     * function: those are all soft, "fall through to native WSI, app still
+     * runs with tearing" cases, but a second concurrently-fullscreen app
+     * landing here has nowhere good to fall back to -- see the comment at
+     * the bottom of this function (near the fail_perimg/fail_gl_setup
+     * labels) for why this one hard-fails instead. Declared here, ahead of
+     * every goto fail_perimg/fail_gl_setup site in this function (including
+     * ones that fire before the DC device is even opened), so it's always
+     * initialized by the time either label runs. */
+    bool window_unavailable = false;
+
     /* Non-NVIDIA passthrough device: forward to the ICD using the real ICD
        surface handle stored in our Surface* wrapper.  The ICD does not know
        about our Surface* pointer and would fault or return an error if given
@@ -3108,10 +3122,12 @@ layer_CreateSwapchainKHR(VkDevice device,
     sc->flip_dc_fd = open(flip_dc_path, O_RDWR | O_CLOEXEC);
     if (sc->flip_dc_fd < 0) {
         LOG_ERR("open %s failed: %m", flip_dc_path);
+        window_unavailable = true;
         goto fail_perimg;
     }
     if (ioctl(sc->flip_dc_fd, TEGRA_DC_EXT_GET_WINDOW, (unsigned long)flip_win_index) < 0) {
         LOG_ERR("GET_WINDOW %d on %s failed: %m", flip_win_index, flip_dc_path);
+        window_unavailable = true;
         goto fail_perimg;
     }
 
@@ -3207,6 +3223,33 @@ fail_gl_setup:
     if (sc->child_colormap) XFreeColormap(surf->dpy, sc->child_colormap);
     if (sc->visinfo) XFree(sc->visinfo);
     free(sc);
+    if (window_unavailable) {
+        /* Hard fail instead of the usual soft fallback: falling through to
+         * native WSI here means the app keeps running and, per every app
+         * tested so far, immediately does its own windowed<->fullscreen
+         * swapchain recreation dance in response -- which tears down and
+         * rebuilds this layer's own (GLX-context-owning) swapchain resources
+         * again right away. Confirmed 2026-08-22: a second fullscreen app
+         * landing here while a first already owns the only hardware overlay
+         * window hangs forever inside NVIDIA's closed glXMakeCurrent on
+         * exactly that immediately-following recreate (gdb backtrace pinned
+         * it to this function's own glXMakeCurrent call, stuck in
+         * libGLX_nvidia.so/libnvidia-glcore.so, while the FIRST app's own
+         * swapchain kept flipping normally and completely unaffected the
+         * whole time -- so it's this app's own churn wedging itself, not
+         * contention from the first app). Returning a real error here
+         * instead means the app's normal Vulkan error handling decides what
+         * happens next (most apps exit or surface an error rather than
+         * silently retry-looping into the same wedge).
+         * VK_ERROR_NATIVE_WINDOW_IN_USE_KHR is the spec-correct code for
+         * "the native window/surface is already in use by another Vulkan
+         * instance" -- precisely this situation. */
+        LOG_ERR("CreateSwapchainKHR: FLIP4 hardware overlay window unavailable "
+                 "(already owned by another process) -- returning "
+                 "VK_ERROR_NATIVE_WINDOW_IN_USE_KHR instead of falling back to "
+                 "native WSI, see comment above this line in flip_layer.c");
+        return VK_ERROR_NATIVE_WINDOW_IN_USE_KHR;
+    }
     /* Soft fail: fall through to the real Vulkan WSI so the app still runs (with tearing). */
     return fallback_to_native_swapchain(dev, device, ci, surf, pAlloc, pOut);
 }
