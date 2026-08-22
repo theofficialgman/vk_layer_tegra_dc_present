@@ -32,11 +32,20 @@ engaging FLIP4 for it, only real per-frame overhead. See the
 `VK_TEGRA_DC_PRESENT_ALLOW_WINDOWED`/`_ALLOW_IMMEDIATE` overrides below
 if you need to test the FLIP4 path itself against either.
 
-**Install:** `make install` builds and installs the `.so` and the
-implicit-layer JSON system-wide, active by default with an opt-out via
-`VK_TEGRA_DC_PRESENT_DISABLE` (see below). See "Build & run" further down
-for ad-hoc/explicit-layer use without installing.
+**Installation:**
 
+```sh
+# install dependencies to build
+sudo apt install build-essential linux-libc-dev libvulkan-dev libgl-dev libx11-dev libx11-xcb-dev libxrandr-dev libxcb1-dev
+# build the vulkan layer
+make
+# install the layer (enabled by default)
+sudo make install
+```
+
+this builds and installs the layer `.so` and the implicit-layer JSON
+system-wide, active by default with an opt-out via `VK_TEGRA_DC_PRESENT_DISABLE`
+(see below).
 
 ## Environment variable reference
 
@@ -200,16 +209,6 @@ was removed)
    immediately before `FLIP4` (maximum lead time before the next vblank)
    moved the tear to match native Vulkan's own position — but didn't
    remove it, which is the core finding above.
-
-## Build & run (explicit layer, no system install)
-
-```sh
-make
-
-LD_LIBRARY_PATH=$(pwd) VK_LAYER_PATH=$(pwd) VK_INSTANCE_LAYERS=VK_LAYER_TEGRA_dc_present VK_TEGRA_DC_PRESENT_LOG=2 \
-    ~/Vulkan/build/bin/gears -vs        # windowed -- falls through to native WSI, see part 4
-    # or: ~/Vulkan/build/bin/gears -f -vs   # fullscreen -- engages FLIP4, tear-free by default
-```
 
 `library_path` in `VkLayer_tegra_dc_present.json` is a bare filename
 (matching what actually gets installed system-wide via `make install`),
