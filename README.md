@@ -232,6 +232,110 @@ Safety notes if you're poking at this again:
   `qdbus org.kde.KWin /Compositor org.kde.kwin.Compositing.active` should
   say `false`; `xprop -root -notype _NET_WM_CM_S0` should say "not found".
 
+## Troubleshooting
+
+Assumes the layer is already installed (`sudo make install`) and enabled
+(the default -- no `VK_TEGRA_DC_PRESENT_DISABLE` set). For any of these, run
+the app from a terminal with `VK_TEGRA_DC_PRESENT_LOG=2` set first -- most
+answers are in that log.
+
+```sh
+VK_TEGRA_DC_PRESENT_LOG=2 your-app
+```
+
+**Is the layer loaded at all?**
+Look for `[VK_LAYER_TEGRA_dc_present] loaded, build ...` as the very first
+line of output. If it's missing:
+- Confirm both install paths exist: `/usr/share/vulkan/implicit_layer.d/VkLayer_tegra_dc_present.json`
+  and `/usr/lib/aarch64-linux-gnu/libVkLayer_tegra_dc_present.so` (or your
+  distro's non-multiarch equivalent, e.g. plain `/usr/lib/` on Lakka).
+- `vulkaninfo 2>&1 | grep -i tegra_dc` should list the layer under
+  "Instance Layers". If it's not there, the loader isn't finding the JSON
+  manifest -- check `VK_LAYER_PATH`/`VK_ADD_LAYER_PATH` aren't overriding
+  the standard search paths.
+- If you see a `WARN`/`ERR` line about failing to `dlopen` the `.so`
+  ("cannot open shared object file"), `library_path` in the JSON is a bare
+  filename by design (see the note above) -- it needs the `.so` on the
+  standard linker search path, not a relative path from wherever you
+  happen to be running the app.
+
+**The app runs, but I don't see any difference (still tearing).**
+The layer only engages FLIP4 for windows that are *exclusively*
+fullscreen with a present mode of FIFO, FIFO_RELAXED, or MAILBOX -- see
+"When it engages" above. Check the log for one of these lines, which
+explain exactly why it fell back to native (tearing) WSI instead:
+- `window is not fullscreen on its target display; falling through to
+  native WSI` -- borderless/maximized windowed doesn't count, even if it
+  visually covers the screen. The window manager has to report real
+  exclusive fullscreen (`_NET_WM_STATE_FULLSCREEN`). Some games have a
+  separate "borderless window" and "fullscreen"/"exclusive fullscreen"
+  setting -- pick the latter.
+- A present-mode line mentioning `IMMEDIATE` -- that mode already accepts
+  tearing on its own by request, so the layer intentionally leaves it
+  alone (see "When it engages"). If you want to test FLIP4 against it
+  anyway, `VK_TEGRA_DC_PRESENT_ALLOW_IMMEDIATE=1` overrides this, diagnostic
+  only.
+- If neither line appears and it's still tearing, run with
+  `VK_TEGRA_DC_PRESENT_LOG=3` and check for `FLIP4 failed:` warnings --
+  that means it did engage but the ioctl itself is erroring; please
+  report this with the log.
+
+**A second fullscreen app won't start, or exits/crashes right away.**
+Expected, by design: this layer currently supports exactly one hardware
+overlay window, so only one fullscreen Vulkan app can use FLIP4 at a
+time. A second one gets `VK_ERROR_NATIVE_WINDOW_IN_USE_KHR` from
+`vkCreateSwapchainKHR` -- a normal, spec-legal Vulkan error, but not every
+app handles it gracefully (some exit, some may crash instead of falling
+back). Close the first fullscreen app before starting the second, or run
+the second one windowed. The log will show `GET_WINDOW ... failed: Device
+or resource busy` right before this happens, confirming that's what
+occurred.
+
+**The app's window went black, or shows a "PRESENTATION PAUSED" message.**
+Not a bug -- this is expected whenever the window is minimized or loses
+focus (e.g. alt-tabbed away) while a FLIP4 presentation is active. Click
+back into the window (or alt-tab back to it) to resume; presentation
+picks up again automatically, no need to restart the app. This is a
+placeholder for the fact that the app's real X11 window is never actually
+drawn into in this design (see "Final architecture") -- normally
+invisible since the hardware overlay plane covers it entirely, briefly
+visible only in this one case.
+
+**`GET_WINDOW ... failed: Device or resource busy` but nothing else is
+using it.**
+Fast windowed→fullscreen resizes (common at app startup, before the
+window manager has applied fullscreen) can leave a very short window
+where a helper process the app spawned (a screensaver-inhibit script,
+for instance) still holds a duplicate of a just-closed device fd -- see
+the `O_CLOEXEC` note in the source. This should self-resolve on the next
+present/recreation; if it doesn't, check `lsof /dev/tegra_dc_1` for
+anything unexpected holding it open.
+
+**Permission errors opening `/dev/tegra_dc_1`.**
+Check `ls -l /dev/tegra_dc_1` and confirm your user can read/write it
+(group membership or udev rule, distro-dependent) -- this is a system
+device-permissions question, not something this layer controls.
+
+**Flatpak-packaged apps don't seem to pick up the layer at all.**
+Known limitation, not yet fixed: Flatpak sandboxes an app away from the
+host's `/usr/share/vulkan/implicit_layer.d/`, and Vulkan implicit layers
+need to be installed into a different, Flatpak-specific location for a
+sandboxed app to see them at all -- this layer isn't installed there yet.
+If you need to test this layer against a Flatpak application, ask
+theofficialgman.
+
+**I want to compare with/without the layer to confirm it's actually
+responsible for a change I'm seeing.**
+`VK_TEGRA_DC_PRESENT_DISABLE=1 your-app` -- transparent passthrough, every
+call goes straight to native Vulkan WSI as if this layer weren't
+installed at all. Setting it to *any* value disables the layer, not just
+`1`.
+
+**Still stuck?** See the full "Environment variable reference" above for
+every diagnostic knob this layer has, and the collapsed investigative
+history below for the reasoning and hardware-verified evidence behind
+each of the behaviors described here.
+
 <details>
 <summary><strong>Full investigative history (2026-08-16 &rarr; 2026-08-19)</strong> -- how this was discovered, dead ends included</summary>
 
