@@ -1051,11 +1051,14 @@ typedef struct Swapchain {
     int      flip_dc_fd;
     int      flip_win_index; /* VK_TEGRA_DC_PRESENT_WIN_INDEX, default DEFAULT_WIN_INDEX --
                                  see the comment where flip_dc_fd is opened */
-    bool     flip_minimized; /* true once the worker has disabled the overlay window
-                                 in response to surf->window being unmapped (minimized) --
-                                 see the map_state check next to the resize check in
-                                 worker_thread_main. Prevents re-sending the disable flip
-                                 every frame, and gates the real content FLIP4 call. */
+    bool     flip_hidden; /* true once the worker has made the overlay window
+                              transparent in response to surf->window either being
+                              unmapped (minimized) or losing focus while still mapped
+                              (alt-tabbed away from, no longer the exclusive fullscreen
+                              window) -- see the map_state/is_wm_focused check next to
+                              the resize check in worker_thread_main. Prevents
+                              re-sending the transparent flip every frame, and gates
+                              the real content FLIP4 call. */
     VkCommandPool flip_cpool;
     uint32_t flip_out_w, flip_out_h; /* clamped to fit the screen, 1:1 */
 
@@ -1113,6 +1116,10 @@ static bool is_dead_swapchain(VkSwapchainKHR s) {
 
 static void track_swapchain(Swapchain *sc);
 static void untrack_swapchain(Swapchain *sc);
+/* Forward-declared so worker_thread_main can call it for the per-frame
+   focus-loss check (alt-tab detection) before its own definition, next to
+   is_wm_fullscreen, later in the file. */
+static bool is_wm_focused(Display *dpy, Window win);
 /* Forward-declared so layer_CreateSwapchainKHR can call it for
    ci->oldSwapchain cleanup (recreation handling) before its own definition
    later in the file. */
@@ -1323,23 +1330,30 @@ static void *worker_thread_main(void *arg) {
             }
         }
 
-        /* Detect minimize (unmap): some apps/WMs unmap the fullscreen
-         * window when it loses relevance (e.g. the mouse leaving the
-         * screen on an exclusive-fullscreen app) -- normal, expected
-         * behavior. FLIP4 presents via a raw hardware overlay plane that
-         * ignores X11 window stacking (see README's "when it engages"
-         * section), so without this check the overlay just keeps showing
-         * the last rendered frame on top of the desktop forever, even
-         * after the window is gone -- confirmed 2026-09-13, reported by
-         * user. Checked on the same worker_dpy round trip as the resize
-         * check just above, so this adds only one extra request, not an
-         * extra connection or extra polling cadence. */
+        /* Detect minimize (unmap) OR losing focus while still mapped (e.g.
+         * alt-tabbed to another window, no longer the exclusive fullscreen
+         * window -- Xorg is now showing something else on top of it).
+         * FLIP4 presents via a raw hardware overlay plane that ignores X11
+         * window stacking (see README's "when it engages" section), so
+         * without this check the overlay just keeps showing the last
+         * rendered frame on top of whatever the user actually switched to,
+         * in both cases -- confirmed 2026-09-13, reported by user. Checked
+         * on the same worker_dpy round trip as the resize check just
+         * above, so the map_state half adds only one extra request; the
+         * focus half (is_wm_focused) is a further _NET_WM_STATE fetch, the
+         * same one CreateSwapchainKHR's FULLSCREEN GATE already relies on
+         * for FULLSCREEN, just for a different atom in the same property. */
         {
             XWindowAttributes wattr;
-            bool now_minimized = false;
+            bool now_unmapped = false;
             if (XGetWindowAttributes(sc->worker_dpy, sc->surf->window, &wattr))
-                now_minimized = (wattr.map_state != IsViewable);
-            if (now_minimized && !sc->flip_minimized) {
+                now_unmapped = (wattr.map_state != IsViewable);
+            /* Only need the (relatively) more expensive focus check while
+               still mapped -- an unmapped window is unambiguously hidden
+               already, no need to also ask whether it's focused. */
+            bool now_focused = now_unmapped ? false : is_wm_focused(sc->worker_dpy, sc->surf->window);
+            bool now_hidden = now_unmapped || !now_focused;
+            if (now_hidden && !sc->flip_hidden) {
                 /* FIRST ATTEMPT (2026-09-13, kept as a record): index = -1
                  * with an otherwise-zeroed windowattr, hoping it meant
                  * "disable this window slot" the way it does in several
@@ -1389,18 +1403,20 @@ static void *worker_thread_main(void *arg) {
                 dflip.win_num = 1;
                 dflip.post_syncpt_fd = -1;
                 if (ioctl(sc->flip_dc_fd, TEGRA_DC_EXT_FLIP4, &dflip) < 0)
-                    LOG_WARN("transparent flip on minimize failed: %m");
+                    LOG_WARN("transparent flip on hide failed: %m");
                 else
-                    LOG_INFO("window unmapped (minimized) -- overlay window made transparent");
+                    LOG_INFO("window %s -- overlay window made transparent",
+                             now_unmapped ? "unmapped (minimized)"
+                                          : "lost focus (no longer exclusive fullscreen)");
                 if (dflip.post_syncpt_fd >= 0) close(dflip.post_syncpt_fd);
-                sc->flip_minimized = true;
-            } else if (!now_minimized && sc->flip_minimized) {
+                sc->flip_hidden = true;
+            } else if (!now_hidden && sc->flip_hidden) {
                 /* No explicit re-enable call needed -- the real content
-                 * FLIP4 call below runs unconditionally once flip_minimized
+                 * FLIP4 call below runs unconditionally once flip_hidden
                  * is false again, and that's what actually re-enables the
                  * window (real index, real buff_id). */
-                LOG_INFO("window remapped (restored) -- resuming overlay presentation");
-                sc->flip_minimized = false;
+                LOG_INFO("window mapped and focused again -- resuming overlay presentation");
+                sc->flip_hidden = false;
             }
         }
 
@@ -1560,15 +1576,16 @@ static void *worker_thread_main(void *arg) {
                     sc->glXWaitVideoSyncSGI(2, 0, &count);
             }
 
-            /* Skip the real content flip entirely while minimized (see the
-             * map_state check above) -- the overlay is already disabled by
-             * the one-shot disable-flip sent on the mapped->unmapped edge,
-             * and calling FLIP4 again here would just re-enable it with
-             * this frame's buffer, undoing that. The vblank wait below
-             * still runs unconditionally so the app's frame submission
-             * stays paced to the display refresh instead of running
-             * unthrottled while minimized. */
-            if (!sc->flip_minimized) {
+            /* Skip the real content flip entirely while hidden (minimized,
+             * or mapped but unfocused/alt-tabbed away -- see the
+             * map_state/is_wm_focused check above) -- the overlay is
+             * already made transparent by the one-shot flip sent on the
+             * visible->hidden edge, and calling FLIP4 again here would
+             * just re-show it with this frame's buffer, undoing that. The
+             * vblank wait below still runs unconditionally so the app's
+             * frame submission stays paced to the display refresh instead
+             * of running unthrottled while hidden. */
+            if (!sc->flip_hidden) {
             struct tegra_dc_ext_flip_windowattr win = {0};
             win.index = sc->flip_win_index;
             /* tegra_dc_ext_pin_window() (util.c) resolves buff_id via
@@ -1665,7 +1682,7 @@ static void *worker_thread_main(void *arg) {
              * that fence was providing. Must close it every call. */
             if (flip.post_syncpt_fd >= 0)
                 close(flip.post_syncpt_fd);
-            } /* !sc->flip_minimized */
+            } /* !sc->flip_hidden */
 
             /* Default (VK_TEGRA_DC_PRESENT_WAIT_AFTER_FLIP unset or 1) SGI vblank
                wait -- see the wait_after_flip comment above for why this
@@ -1673,8 +1690,7 @@ static void *worker_thread_main(void *arg) {
                HERE, right before FLIP4" comment further up (the
                VK_TEGRA_DC_PRESENT_WAIT_AFTER_FLIP=0 path) for the more conservative
                alternative ordering. Runs unconditionally, including while
-               minimized -- see the comment on the flip_minimized check
-               above. */
+               hidden -- see the comment on the flip_hidden check above. */
             if (wait_after_flip &&
                 sc->glXWaitVideoSyncSGI && sc->present_mode != VK_PRESENT_MODE_IMMEDIATE_KHR) {
                 unsigned int count = 0;
@@ -2205,6 +2221,55 @@ static bool is_wm_fullscreen(Display *dpy, Window win) {
         cur = parent;
     }
     return false;
+}
+
+/* Per-frame counterpart to is_wm_fullscreen, for detecting alt-tab: is this
+ * window (walking up to the WM-managed frame, same as is_wm_fullscreen)
+ * currently the one holding input focus per EWMH _NET_WM_STATE_FOCUSED?
+ * Used every frame by worker_thread_main to catch a fullscreen window
+ * that's still mapped but no longer exclusively on screen (alt-tabbed away
+ * from) -- is_wm_fullscreen alone can't see this, since the FULLSCREEN
+ * state bit itself doesn't change on a focus switch, only FOCUSED does.
+ *
+ * Fails open (returns true, i.e. "assume focused, don't hide") whenever
+ * the state can't actually be determined -- an unsupported/non-EWMH WM
+ * should fall back to this layer's original behavior (always visible),
+ * not a permanently-blanked overlay. That's only the "never found a
+ * _NET_WM_STATE property anywhere in the ancestor chain" case; once a
+ * property IS found (the same ancestor is_wm_fullscreen would have used),
+ * it's treated as authoritative and its FOCUSED bit decides the answer,
+ * even if that means returning false. */
+static bool is_wm_focused(Display *dpy, Window win) {
+    Atom state_atom = XInternAtom(dpy, "_NET_WM_STATE", True);
+    Atom focused_atom = XInternAtom(dpy, "_NET_WM_STATE_FOCUSED", True);
+    if (state_atom == None || focused_atom == None) return true;
+
+    Window cur = win;
+    for (int depth = 0; depth < 8; depth++) {
+        Atom actual_type;
+        int actual_format;
+        unsigned long nitems, bytes_after;
+        unsigned char *prop = NULL;
+        if (XGetWindowProperty(dpy, cur, state_atom, 0, 1024, False, XA_ATOM,
+                                &actual_type, &actual_format, &nitems, &bytes_after,
+                                &prop) == Success && prop) {
+            bool focused = false;
+            if (actual_type == XA_ATOM && actual_format == 32) {
+                Atom *atoms = (Atom *)prop;
+                for (unsigned long i = 0; i < nitems; i++) {
+                    if (atoms[i] == focused_atom) { focused = true; break; }
+                }
+            }
+            XFree(prop);
+            return focused;
+        }
+        Window root, parent; Window *children = NULL; unsigned int nchildren = 0;
+        if (!XQueryTree(dpy, cur, &root, &parent, &children, &nchildren)) break;
+        if (children) XFree(children);
+        if (parent == 0 || parent == root) break; /* reached the root */
+        cur = parent;
+    }
+    return true; /* never found the property -- fail open */
 }
 
 static void window_size(Surface *s, uint32_t *w, uint32_t *h); /* defined below */
