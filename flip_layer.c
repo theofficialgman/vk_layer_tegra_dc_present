@@ -1051,6 +1051,11 @@ typedef struct Swapchain {
     int      flip_dc_fd;
     int      flip_win_index; /* VK_TEGRA_DC_PRESENT_WIN_INDEX, default DEFAULT_WIN_INDEX --
                                  see the comment where flip_dc_fd is opened */
+    bool     flip_minimized; /* true once the worker has disabled the overlay window
+                                 in response to surf->window being unmapped (minimized) --
+                                 see the map_state check next to the resize check in
+                                 worker_thread_main. Prevents re-sending the disable flip
+                                 every frame, and gates the real content FLIP4 call. */
     VkCommandPool flip_cpool;
     uint32_t flip_out_w, flip_out_h; /* clamped to fit the screen, 1:1 */
 
@@ -1318,6 +1323,87 @@ static void *worker_thread_main(void *arg) {
             }
         }
 
+        /* Detect minimize (unmap): some apps/WMs unmap the fullscreen
+         * window when it loses relevance (e.g. the mouse leaving the
+         * screen on an exclusive-fullscreen app) -- normal, expected
+         * behavior. FLIP4 presents via a raw hardware overlay plane that
+         * ignores X11 window stacking (see README's "when it engages"
+         * section), so without this check the overlay just keeps showing
+         * the last rendered frame on top of the desktop forever, even
+         * after the window is gone -- confirmed 2026-09-13, reported by
+         * user. Checked on the same worker_dpy round trip as the resize
+         * check just above, so this adds only one extra request, not an
+         * extra connection or extra polling cadence. */
+        {
+            XWindowAttributes wattr;
+            bool now_minimized = false;
+            if (XGetWindowAttributes(sc->worker_dpy, sc->surf->window, &wattr))
+                now_minimized = (wattr.map_state != IsViewable);
+            if (now_minimized && !sc->flip_minimized) {
+                /* FIRST ATTEMPT (2026-09-13, kept as a record): index = -1
+                 * with an otherwise-zeroed windowattr, hoping it meant
+                 * "disable this window slot" the way it does in several
+                 * other DC driver families -- confirmed WRONG empirically,
+                 * tegra_dc_ext_flip() on THIS driver rejects it with
+                 * -EINVAL. Nothing in tegra_dc_ext.h documents index<0
+                 * behavior for FLIP4 (only GET_WINDOW/PUT_WINDOW use it as
+                 * a plain window number), so this was a guess, and the
+                 * driver didn't accept it.
+                 *
+                 * Working mechanism: a NORMAL, fully-valid flip -- same
+                 * window index, same geometry/format/blocklinear fields as
+                 * the real content flip below -- but with blending enabled
+                 * and global_alpha=0, requiring TEGRA_DC_EXT_FLIP_FLAG_
+                 * GLOBAL_ALPHA per that field's own doc comment. This is
+                 * the exact mechanism bug #2 in this file's own "Bugs
+                 * found and fixed" history already proved controls real
+                 * per-pixel transparency on this driver (global_alpha=0
+                 * there caused real correct pixel data to render fully
+                 * invisible, found the hard way as a bug -- deliberately
+                 * reused here as the fix). Content doesn't matter (fully
+                 * transparent either way), so this reuses images[idx]'s
+                 * already-exported gob_dst_fd rather than needing a fresh
+                 * buffer -- exported once at swapchain creation, valid
+                 * for the swapchain's whole lifetime regardless of
+                 * whether this frame's compute dispatch below runs. */
+                PerImage *dpi = &sc->images[idx];
+                struct tegra_dc_ext_flip_windowattr dwin = {0};
+                dwin.index = sc->flip_win_index;
+                dwin.buff_id = (__u32)dpi->gob_dst_fd;
+                dwin.blend = TEGRA_DC_EXT_BLEND_PREMULT;
+                dwin.stride = (__u32)dpi->gob_row_pitch;
+                dwin.pixformat = TEGRA_DC_EXT_FMT_T_A8R8G8B8;
+                dwin.w = sc->flip_out_w << 12;
+                dwin.h = sc->flip_out_h << 12;
+                dwin.out_x = 0; dwin.out_y = 0;
+                dwin.out_w = sc->flip_out_w; dwin.out_h = sc->flip_out_h;
+                dwin.z = 255;
+                dwin.global_alpha = 0; /* fully transparent */
+                dwin.flags |= TEGRA_DC_EXT_FLIP_FLAG_BLOCKLINEAR |
+                              TEGRA_DC_EXT_FLIP_FLAG_GLOBAL_ALPHA;
+                dwin.block_height_log2 = (__u8)sc->gob_block_height_log2;
+                dwin.swap_interval = 1;
+                dwin.pre_syncpt_id = FLIP_TEST_NVSYNCPT_INVALID;
+                struct tegra_dc_ext_flip_4 dflip = {0};
+                dflip.win = (__u64)(uintptr_t)&dwin;
+                dflip.win_num = 1;
+                dflip.post_syncpt_fd = -1;
+                if (ioctl(sc->flip_dc_fd, TEGRA_DC_EXT_FLIP4, &dflip) < 0)
+                    LOG_WARN("transparent flip on minimize failed: %m");
+                else
+                    LOG_INFO("window unmapped (minimized) -- overlay window made transparent");
+                if (dflip.post_syncpt_fd >= 0) close(dflip.post_syncpt_fd);
+                sc->flip_minimized = true;
+            } else if (!now_minimized && sc->flip_minimized) {
+                /* No explicit re-enable call needed -- the real content
+                 * FLIP4 call below runs unconditionally once flip_minimized
+                 * is false again, and that's what actually re-enables the
+                 * window (real index, real buff_id). */
+                LOG_INFO("window remapped (restored) -- resuming overlay presentation");
+                sc->flip_minimized = false;
+            }
+        }
+
         {
             /* FLIP_TEST (no-GL): pure Vulkan. One command buffer does the
              * whole job -- barrier the app's OPTIMAL image to a copy
@@ -1474,6 +1560,15 @@ static void *worker_thread_main(void *arg) {
                     sc->glXWaitVideoSyncSGI(2, 0, &count);
             }
 
+            /* Skip the real content flip entirely while minimized (see the
+             * map_state check above) -- the overlay is already disabled by
+             * the one-shot disable-flip sent on the mapped->unmapped edge,
+             * and calling FLIP4 again here would just re-enable it with
+             * this frame's buffer, undoing that. The vblank wait below
+             * still runs unconditionally so the app's frame submission
+             * stays paced to the display refresh instead of running
+             * unthrottled while minimized. */
+            if (!sc->flip_minimized) {
             struct tegra_dc_ext_flip_windowattr win = {0};
             win.index = sc->flip_win_index;
             /* tegra_dc_ext_pin_window() (util.c) resolves buff_id via
@@ -1555,21 +1650,6 @@ static void *worker_thread_main(void *arg) {
             if (_f4_ret < 0)
                 LOG_WARN("FLIP4 failed: %m");
 
-            /* Default (VK_TEGRA_DC_PRESENT_WAIT_AFTER_FLIP unset or 1) SGI vblank
-               wait -- see the wait_after_flip comment above for why this
-               is the default as of 2026-08-18 and the "Wait for vblank
-               HERE, right before FLIP4" comment further up (the
-               VK_TEGRA_DC_PRESENT_WAIT_AFTER_FLIP=0 path) for the more conservative
-               alternative ordering. */
-            if (wait_after_flip &&
-                sc->glXWaitVideoSyncSGI && sc->present_mode != VK_PRESENT_MODE_IMMEDIATE_KHR) {
-                unsigned int count = 0;
-                if (sc->glXGetVideoSyncSGI(&count) == 0)
-                    sc->glXWaitVideoSyncSGI(2, (count + 1) & 1, &count);
-                else
-                    sc->glXWaitVideoSyncSGI(2, 0, &count);
-            }
-
             /* tegra_dc_ioctl() (dev.c) uses post_syncpt_fd as an OUTPUT
              * slot, not just input: with no explicit user_data syncpt
              * request (we send none), it creates a brand new post-flip
@@ -1585,6 +1665,24 @@ static void *worker_thread_main(void *arg) {
              * that fence was providing. Must close it every call. */
             if (flip.post_syncpt_fd >= 0)
                 close(flip.post_syncpt_fd);
+            } /* !sc->flip_minimized */
+
+            /* Default (VK_TEGRA_DC_PRESENT_WAIT_AFTER_FLIP unset or 1) SGI vblank
+               wait -- see the wait_after_flip comment above for why this
+               is the default as of 2026-08-18 and the "Wait for vblank
+               HERE, right before FLIP4" comment further up (the
+               VK_TEGRA_DC_PRESENT_WAIT_AFTER_FLIP=0 path) for the more conservative
+               alternative ordering. Runs unconditionally, including while
+               minimized -- see the comment on the flip_minimized check
+               above. */
+            if (wait_after_flip &&
+                sc->glXWaitVideoSyncSGI && sc->present_mode != VK_PRESENT_MODE_IMMEDIATE_KHR) {
+                unsigned int count = 0;
+                if (sc->glXGetVideoSyncSGI(&count) == 0)
+                    sc->glXWaitVideoSyncSGI(2, (count + 1) & 1, &count);
+                else
+                    sc->glXWaitVideoSyncSGI(2, 0, &count);
+            }
         }
 
         /* Mark slot free AFTER the present completes. This is the
