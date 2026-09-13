@@ -1000,6 +1000,61 @@ typedef struct Swapchain {
     int  (*glXGetVideoSyncSGI )(unsigned int *count);
     int  (*glXWaitVideoSyncSGI)(int divisor, int remainder, unsigned int *count);
 
+    /* "Presentation paused" text, drawn into sc->child_window (via
+       glXSwapBuffers -- the only place this design ever calls it, since
+       it's a one-shot draw on the hidden transition, not a per-frame
+       cost) so the app's real X11 window isn't just black while the FLIP4
+       overlay is transparent -- see draw_hidden_text()'s comment. Every
+       GL entry point below GL 1.1 (i.e. all of these) needs resolving
+       through glXGetProcAddressARB the same as glXWaitVideoSyncSGI above,
+       since libGL is dlopen'd, never linked -- see the big block comment
+       near the top of this file on why. */
+    PFNGLCREATESHADERPROC             glCreateShader;
+    PFNGLSHADERSOURCEPROC             glShaderSource;
+    PFNGLCOMPILESHADERPROC            glCompileShader;
+    PFNGLGETSHADERIVPROC              glGetShaderiv;
+    PFNGLGETSHADERINFOLOGPROC         glGetShaderInfoLog;
+    PFNGLCREATEPROGRAMPROC            glCreateProgram;
+    PFNGLATTACHSHADERPROC             glAttachShader;
+    PFNGLLINKPROGRAMPROC              glLinkProgram;
+    PFNGLGETPROGRAMIVPROC             glGetProgramiv;
+    PFNGLGETPROGRAMINFOLOGPROC        glGetProgramInfoLog;
+    PFNGLUSEPROGRAMPROC               glUseProgram;
+    PFNGLDELETESHADERPROC             glDeleteShader;
+    PFNGLGENVERTEXARRAYSPROC          glGenVertexArrays;
+    PFNGLBINDVERTEXARRAYPROC          glBindVertexArray;
+    PFNGLGENBUFFERSPROC               glGenBuffers;
+    PFNGLBINDBUFFERPROC               glBindBuffer;
+    PFNGLBUFFERDATAPROC               glBufferData;
+    PFNGLVERTEXATTRIBPOINTERPROC      glVertexAttribPointer;
+    PFNGLENABLEVERTEXATTRIBARRAYPROC  glEnableVertexAttribArray;
+    PFNGLACTIVETEXTUREPROC            glActiveTexture;
+    PFNGLGETUNIFORMLOCATIONPROC       glGetUniformLocation;
+    PFNGLUNIFORM1IPROC                glUniform1i;
+    /* Deliberately absent from the global GLX_FUNCS table (see its own
+       comment) since the normal frame path never swaps -- resolved here
+       instead, specifically for draw_hidden_text's one-shot use. No PFN
+       typedef exists for it (assumed statically linked normally), hence
+       the hand-written signature. */
+    void (*glXSwapBuffers)(Display *dpy, GLXDrawable drawable);
+    /* Core GL 1.1 -- still need resolving (never linked), but glext.h
+       doesn't provide PFN typedefs for these, so spelled out by hand. */
+    void (*glGenTextures)(GLsizei n, GLuint *textures);
+    void (*glBindTexture)(GLenum target, GLuint texture);
+    void (*glTexImage2D)(GLenum target, GLint level, GLint internalformat,
+                          GLsizei width, GLsizei height, GLint border,
+                          GLenum format, GLenum type, const void *pixels);
+    void (*glTexParameteri)(GLenum target, GLenum pname, GLint param);
+    void (*glPixelStorei)(GLenum pname, GLint param);
+    void (*glClearColor)(GLfloat r, GLfloat g, GLfloat b, GLfloat a);
+    void (*glClear)(GLbitfield mask);
+    void (*glDrawArrays)(GLenum mode, GLint first, GLsizei count);
+
+    bool   text_ready; /* setup_hidden_text() succeeded -- gates whether
+                           draw_hidden_text() is even attempted. */
+    GLuint text_prog, text_vao, text_vbo, text_tex;
+    GLint  text_tex_uniform;
+
     /* Acquire ring */
     uint32_t      next_acquire;       /* round-robin starting point */
 
@@ -1120,6 +1175,10 @@ static void untrack_swapchain(Swapchain *sc);
    focus-loss check (alt-tab detection) before its own definition, next to
    is_wm_fullscreen, later in the file. */
 static bool is_wm_focused(Display *dpy, Window win);
+/* Forward-declared so worker_thread_main can call it on the visible->hidden
+   transition, before its own definition (with the rest of the "hidden
+   overlay placeholder text" section) later in the file. */
+static void draw_hidden_text(Swapchain *sc, int win_w, int win_h);
 /* Forward-declared so layer_CreateSwapchainKHR can call it for
    ci->oldSwapchain cleanup (recreation handling) before its own definition
    later in the file. */
@@ -1409,6 +1468,14 @@ static void *worker_thread_main(void *arg) {
                              now_unmapped ? "unmapped (minimized)"
                                           : "lost focus (no longer exclusive fullscreen)");
                 if (dflip.post_syncpt_fd >= 0) close(dflip.post_syncpt_fd);
+                /* The transparent DC flip above only stops the FLIP4
+                 * overlay from covering the desktop -- it does nothing
+                 * for the app's own X11 window, which (see
+                 * draw_hidden_text's comment) has never had anything
+                 * real drawn into it and would otherwise just be black
+                 * underneath. Paint the placeholder message into it now
+                 * that it's about to actually become visible. */
+                draw_hidden_text(sc, last_win_w, last_win_h);
                 sc->flip_hidden = true;
             } else if (!now_hidden && sc->flip_hidden) {
                 /* No explicit re-enable call needed -- the real content
@@ -1811,7 +1878,325 @@ static bool resolve_gl_funcs(Swapchain *sc) {
         return false;
     }
     LOG_INFO("GLX_SGI_video_sync present; will sleep in glXWaitVideoSyncSGI between frames");
+
+    /* "Presentation paused" text (see draw_hidden_text) is a nice-to-have,
+       not core functionality -- unlike the SGI functions above, failing to
+       resolve any of these logs a warning and leaves sc->text_ready false
+       (checked before every use) rather than failing the whole swapchain. */
+#define RESOLVE_GL(field, name) \
+    sc->field = (__typeof__(sc->field))glXGetProcAddressARB((const GLubyte*)name)
+    RESOLVE_GL(glCreateShader, "glCreateShader");
+    RESOLVE_GL(glShaderSource, "glShaderSource");
+    RESOLVE_GL(glCompileShader, "glCompileShader");
+    RESOLVE_GL(glGetShaderiv, "glGetShaderiv");
+    RESOLVE_GL(glGetShaderInfoLog, "glGetShaderInfoLog");
+    RESOLVE_GL(glCreateProgram, "glCreateProgram");
+    RESOLVE_GL(glAttachShader, "glAttachShader");
+    RESOLVE_GL(glLinkProgram, "glLinkProgram");
+    RESOLVE_GL(glGetProgramiv, "glGetProgramiv");
+    RESOLVE_GL(glGetProgramInfoLog, "glGetProgramInfoLog");
+    RESOLVE_GL(glUseProgram, "glUseProgram");
+    RESOLVE_GL(glDeleteShader, "glDeleteShader");
+    RESOLVE_GL(glGenVertexArrays, "glGenVertexArrays");
+    RESOLVE_GL(glBindVertexArray, "glBindVertexArray");
+    RESOLVE_GL(glGenBuffers, "glGenBuffers");
+    RESOLVE_GL(glBindBuffer, "glBindBuffer");
+    RESOLVE_GL(glBufferData, "glBufferData");
+    RESOLVE_GL(glVertexAttribPointer, "glVertexAttribPointer");
+    RESOLVE_GL(glEnableVertexAttribArray, "glEnableVertexAttribArray");
+    RESOLVE_GL(glActiveTexture, "glActiveTexture");
+    RESOLVE_GL(glGetUniformLocation, "glGetUniformLocation");
+    RESOLVE_GL(glUniform1i, "glUniform1i");
+    RESOLVE_GL(glXSwapBuffers, "glXSwapBuffers");
+    RESOLVE_GL(glGenTextures, "glGenTextures");
+    RESOLVE_GL(glBindTexture, "glBindTexture");
+    RESOLVE_GL(glTexImage2D, "glTexImage2D");
+    RESOLVE_GL(glTexParameteri, "glTexParameteri");
+    RESOLVE_GL(glPixelStorei, "glPixelStorei");
+    RESOLVE_GL(glClearColor, "glClearColor");
+    RESOLVE_GL(glClear, "glClear");
+    RESOLVE_GL(glDrawArrays, "glDrawArrays");
+#undef RESOLVE_GL
+    if (!sc->glCreateShader || !sc->glShaderSource || !sc->glCompileShader ||
+        !sc->glGetShaderiv || !sc->glGetShaderInfoLog || !sc->glCreateProgram ||
+        !sc->glAttachShader || !sc->glLinkProgram || !sc->glGetProgramiv ||
+        !sc->glGetProgramInfoLog || !sc->glUseProgram || !sc->glDeleteShader ||
+        !sc->glGenVertexArrays || !sc->glBindVertexArray || !sc->glGenBuffers ||
+        !sc->glBindBuffer || !sc->glBufferData || !sc->glVertexAttribPointer ||
+        !sc->glEnableVertexAttribArray || !sc->glActiveTexture ||
+        !sc->glGetUniformLocation || !sc->glUniform1i || !sc->glGenTextures ||
+        !sc->glBindTexture || !sc->glTexImage2D || !sc->glTexParameteri ||
+        !sc->glPixelStorei || !sc->glClearColor || !sc->glClear || !sc->glDrawArrays ||
+        !sc->glXSwapBuffers) {
+        LOG_WARN("one or more GL text-rendering entry points unavailable -- "
+                 "the hidden overlay will stay a plain color, no \"presentation "
+                 "paused\" message");
+    }
     return true;
+}
+
+/* ----------------------------------------------------------------------- */
+/* "Presentation paused" placeholder text                                  */
+/* ----------------------------------------------------------------------- */
+
+/* The FLIP4 overlay bypasses X11 window stacking entirely (see README), so
+ * the app's own X11 window has never had anything real drawn into it --
+ * this design never calls glXSwapBuffers in the normal frame path at all,
+ * only glXWaitVideoSyncSGI for timing (see the big comment on that field).
+ * That leaves the window showing its plain XCreateWindow background_pixel
+ * (0, i.e. solid black) whenever the FLIP4 overlay goes transparent
+ * (minimized or alt-tabbed away -- see flip_hidden), which reads as "the
+ * app crashed" rather than "still running, just not focused". This draws
+ * a small message into sc->child_window instead, once per hidden
+ * transition (draw_hidden_text is never called from the per-frame path),
+ * using the same GLX context and window this design already keeps alive
+ * purely for vblank timing -- no new window, no new context.
+ *
+ * A tiny hand-picked 5x7 dot-matrix bitmap font, not a general text
+ * renderer: only the letters this file's own fixed status message
+ * actually uses. A full ASCII table would be more reusable but this isn't
+ * meant to become a general-purpose text feature -- extend the table if a
+ * future message needs another letter. */
+typedef struct { char c; uint8_t rows[7]; } Glyph5x7;
+static const Glyph5x7 g_font5x7[] = {
+    {'A', {0x0e,0x11,0x11,0x1f,0x11,0x11,0x11}},
+    {'C', {0x0f,0x10,0x10,0x10,0x10,0x10,0x0f}},
+    {'D', {0x1e,0x11,0x11,0x11,0x11,0x11,0x1e}},
+    {'E', {0x1f,0x10,0x10,0x1e,0x10,0x10,0x1f}},
+    {'I', {0x0e,0x04,0x04,0x04,0x04,0x04,0x0e}},
+    {'K', {0x11,0x12,0x14,0x18,0x14,0x12,0x11}},
+    {'L', {0x10,0x10,0x10,0x10,0x10,0x10,0x1f}},
+    {'M', {0x11,0x1b,0x15,0x15,0x11,0x11,0x11}},
+    {'N', {0x11,0x19,0x15,0x15,0x13,0x11,0x11}},
+    {'O', {0x0e,0x11,0x11,0x11,0x11,0x11,0x0e}},
+    {'P', {0x1e,0x11,0x11,0x1e,0x10,0x10,0x10}},
+    {'R', {0x1e,0x11,0x11,0x1e,0x14,0x12,0x11}},
+    {'S', {0x0f,0x10,0x10,0x0e,0x01,0x01,0x1e}},
+    {'T', {0x1f,0x04,0x04,0x04,0x04,0x04,0x04}},
+    {'U', {0x11,0x11,0x11,0x11,0x11,0x11,0x0e}},
+    {' ', {0,0,0,0,0,0,0}},
+};
+#define FONT_GLYPH_COUNT ((int)(sizeof(g_font5x7) / sizeof(g_font5x7[0])))
+
+static const Glyph5x7 *find_glyph(char c) {
+    for (int i = 0; i < FONT_GLYPH_COUNT; i++)
+        if (g_font5x7[i].c == c) return &g_font5x7[i];
+    return NULL;
+}
+
+static const char *g_hidden_text_line1 = "PRESENTATION PAUSED";
+static const char *g_hidden_text_line2 = "CLICK TO RESUME";
+
+static const char *g_hidden_text_vs =
+    "#version 330 core\n"
+    "layout(location=0) in vec2 aPos;\n"
+    "layout(location=1) in vec2 aUV;\n"
+    "out vec2 vUV;\n"
+    "void main() { gl_Position = vec4(aPos, 0.0, 1.0); vUV = aUV; }\n";
+static const char *g_hidden_text_fs =
+    "#version 330 core\n"
+    "in vec2 vUV;\n"
+    "out vec4 FragColor;\n"
+    "uniform sampler2D uTex;\n"
+    "void main() {\n"
+    "    float a = texture(uTex, vUV).r;\n"
+    "    if (a < 0.5) discard;\n"
+    "    FragColor = vec4(1.0, 1.0, 1.0, 1.0);\n"
+    "}\n";
+
+/* Compiles one shader stage, logging the info log on failure. Returns 0 on
+   failure (matches glCreateShader's own "0 is invalid" convention). */
+static GLuint compile_shader_stage(Swapchain *sc, GLenum stage, const char *src) {
+    GLuint sh = sc->glCreateShader(stage);
+    sc->glShaderSource(sh, 1, &src, NULL);
+    sc->glCompileShader(sh);
+    GLint ok = 0;
+    sc->glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[512];
+        sc->glGetShaderInfoLog(sh, sizeof(log), NULL, log);
+        LOG_WARN("hidden-text shader compile failed: %s", log);
+        sc->glDeleteShader(sh);
+        return 0;
+    }
+    return sh;
+}
+
+/* One-time setup: compile the shader program, build the font atlas texture
+   (all glyphs side by side, GL_RED, one byte per pixel), and allocate a
+   VAO/VBO sized for the longest of the two fixed message lines. Called
+   once from layer_CreateSwapchainKHR right after resolve_gl_funcs
+   succeeds, while the main thread still has sc->glctx current on
+   sc->child_window -- these are server-side GL objects owned by the
+   context, not the X connection, so the worker thread making the same
+   context current on its own connection later sees them unchanged (same
+   assumption this whole file already relies on for sc->glctx itself, see
+   worker_thread_main's own comment on that). Never explicitly torn down:
+   glXDestroyContext (called in every teardown path already) releases
+   everything created against that context, GL/GLX's own guarantee. */
+static bool setup_hidden_text(Swapchain *sc) {
+    if (!sc->glCreateShader) return false; /* resolve_gl_funcs already warned */
+
+    GLuint vs = compile_shader_stage(sc, GL_VERTEX_SHADER, g_hidden_text_vs);
+    GLuint fs = vs ? compile_shader_stage(sc, GL_FRAGMENT_SHADER, g_hidden_text_fs) : 0;
+    if (!vs || !fs) {
+        if (vs) sc->glDeleteShader(vs);
+        return false;
+    }
+    sc->text_prog = sc->glCreateProgram();
+    sc->glAttachShader(sc->text_prog, vs);
+    sc->glAttachShader(sc->text_prog, fs);
+    sc->glLinkProgram(sc->text_prog);
+    sc->glDeleteShader(vs);
+    sc->glDeleteShader(fs);
+    GLint linked = 0;
+    sc->glGetProgramiv(sc->text_prog, GL_LINK_STATUS, &linked);
+    if (!linked) {
+        char log[512];
+        sc->glGetProgramInfoLog(sc->text_prog, sizeof(log), NULL, log);
+        LOG_WARN("hidden-text program link failed: %s", log);
+        return false;
+    }
+    sc->text_tex_uniform = sc->glGetUniformLocation(sc->text_prog, "uTex");
+
+    /* Atlas: one row of FONT_GLYPH_COUNT glyphs, 5x7 each, GL_RED/UNSIGNED_BYTE. */
+    int atlas_w = FONT_GLYPH_COUNT * 5, atlas_h = 7;
+    uint8_t *atlas = (uint8_t *)calloc((size_t)atlas_w * (size_t)atlas_h, 1);
+    if (!atlas) return false;
+    for (int g = 0; g < FONT_GLYPH_COUNT; g++) {
+        for (int row = 0; row < 7; row++) {
+            uint8_t bits = g_font5x7[g].rows[row];
+            for (int col = 0; col < 5; col++) {
+                if (bits & (1u << (4 - col)))
+                    atlas[row * atlas_w + g * 5 + col] = 255;
+            }
+        }
+    }
+    sc->glGenTextures(1, &sc->text_tex);
+    sc->glBindTexture(GL_TEXTURE_2D, sc->text_tex);
+    sc->glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    sc->glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, atlas_w, atlas_h, 0, GL_RED, GL_UNSIGNED_BYTE, atlas);
+    sc->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    sc->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    sc->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    sc->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    free(atlas);
+
+    /* VBO sized for the longer of the two lines, 6 vertices/char, 4 floats
+       (x,y,u,v) per vertex -- draw_hidden_text re-fills it with
+       glBufferData (not SubData) each hidden transition, since it's a
+       rare event, not a per-frame cost, so there's no reason to bother
+       with the extra bookkeeping SubData would need. */
+    size_t max_chars = strlen(g_hidden_text_line1) > strlen(g_hidden_text_line2)
+                        ? strlen(g_hidden_text_line1) : strlen(g_hidden_text_line2);
+    sc->glGenVertexArrays(1, &sc->text_vao);
+    sc->glGenBuffers(1, &sc->text_vbo);
+    sc->glBindVertexArray(sc->text_vao);
+    sc->glBindBuffer(GL_ARRAY_BUFFER, sc->text_vbo);
+    sc->glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(max_chars * 6 * 4 * sizeof(float)),
+                      NULL, GL_DYNAMIC_DRAW);
+    sc->glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)0);
+    sc->glEnableVertexAttribArray(0);
+    sc->glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)(2 * sizeof(float)));
+    sc->glEnableVertexAttribArray(1);
+    sc->glBindVertexArray(0);
+
+    sc->text_ready = true;
+    LOG_INFO("hidden-overlay placeholder text ready");
+    return true;
+}
+
+/* Appends one line's worth of quads (6 vertices each, skipping spaces) to
+   *out, returning the new vertex count. win_w/win_h are the CURRENT window
+   size (re-read every call, not cached from setup time) so the message
+   stays centered even if the window was resized while hidden. Layout math
+   is plain pixel space (origin top-left, y-down) converted to NDC
+   (origin center, y-up) per vertex -- see the comment block above
+   g_hidden_text_vs for why no separate projection matrix/uniform is used:
+   this is simple enough to bake directly into vertex positions instead. */
+#define TEXT_SCALE 8 /* pixels per font-bitmap unit; each glyph cell is
+                        5*TEXT_SCALE x 7*TEXT_SCALE pixels on screen */
+static int append_text_line(float *out, int out_count, const char *line,
+                             int win_w, int win_h, float center_y_px) {
+    int char_w = 5 * TEXT_SCALE, char_h = 7 * TEXT_SCALE, spacing = TEXT_SCALE;
+    int len = (int)strlen(line);
+    int total_w = len * char_w + (len - 1) * spacing;
+    float x0 = ((float)win_w - (float)total_w) / 2.0f;
+    float y0 = center_y_px - (float)char_h / 2.0f;
+    float atlas_w = (float)(FONT_GLYPH_COUNT * 5);
+
+    for (int i = 0; i < len; i++) {
+        float cx0 = x0 + i * (char_w + spacing);
+        float cx1 = cx0 + char_w;
+        float cy0 = y0, cy1 = y0 + char_h;
+        char ch = line[i];
+        if (ch != ' ') {
+            const Glyph5x7 *gl = find_glyph(ch);
+            if (gl) {
+                int glyph_idx = (int)(gl - g_font5x7);
+                float u0 = (glyph_idx * 5) / atlas_w;
+                float u1 = ((glyph_idx + 1) * 5) / atlas_w;
+                float nx0 = (cx0 / win_w) * 2.0f - 1.0f;
+                float nx1 = (cx1 / win_w) * 2.0f - 1.0f;
+                float ny0 = 1.0f - (cy0 / win_h) * 2.0f; /* top edge */
+                float ny1 = 1.0f - (cy1 / win_h) * 2.0f; /* bottom edge */
+                float verts[6][4] = {
+                    { nx0, ny0, u0, 0.0f }, { nx0, ny1, u0, 1.0f }, { nx1, ny0, u1, 0.0f },
+                    { nx1, ny0, u1, 0.0f }, { nx0, ny1, u0, 1.0f }, { nx1, ny1, u1, 1.0f },
+                };
+                for (int v = 0; v < 6; v++) {
+                    out[out_count * 4 + 0] = verts[v][0];
+                    out[out_count * 4 + 1] = verts[v][1];
+                    out[out_count * 4 + 2] = verts[v][2];
+                    out[out_count * 4 + 3] = verts[v][3];
+                    out_count++;
+                }
+            }
+        }
+    }
+    return out_count;
+}
+
+/* Draws the "presentation paused / click to resume" message into
+   sc->child_window and presents it with a one-shot glXSwapBuffers. Called
+   exactly once per visible->hidden transition (see the flip_hidden check
+   in worker_thread_main) -- never per-frame, so this doesn't reintroduce
+   the glXSwapBuffers-is-a-spin-loop cost the big comment on
+   glXWaitVideoSyncSGI warns about for continuous use; a single one-shot
+   swap is cheap regardless. Assumes sc->glctx is already current on
+   sc->child_window via sc->worker_dpy, true throughout worker_thread_main. */
+static void draw_hidden_text(Swapchain *sc, int win_w, int win_h) {
+    if (!sc->text_ready || win_w <= 0 || win_h <= 0) return;
+
+    size_t max_chars = strlen(g_hidden_text_line1) > strlen(g_hidden_text_line2)
+                        ? strlen(g_hidden_text_line1) : strlen(g_hidden_text_line2);
+    float *verts = (float *)malloc(max_chars * 2 * 6 * 4 * sizeof(float));
+    if (!verts) return;
+
+    int line_h = 7 * TEXT_SCALE, line_gap = 2 * TEXT_SCALE;
+    float block_h = (float)(2 * line_h + line_gap);
+    float line1_center_y = ((float)win_h - block_h) / 2.0f + line_h / 2.0f;
+    float line2_center_y = line1_center_y + line_h + line_gap;
+
+    int count = append_text_line(verts, 0, g_hidden_text_line1, win_w, win_h, line1_center_y);
+    count = append_text_line(verts, count, g_hidden_text_line2, win_w, win_h, line2_center_y);
+
+    sc->glClearColor(0.08f, 0.08f, 0.12f, 1.0f);
+    sc->glClear(GL_COLOR_BUFFER_BIT);
+
+    if (count > 0) {
+        sc->glUseProgram(sc->text_prog);
+        sc->glActiveTexture(GL_TEXTURE0);
+        sc->glBindTexture(GL_TEXTURE_2D, sc->text_tex);
+        sc->glUniform1i(sc->text_tex_uniform, 0);
+        sc->glBindVertexArray(sc->text_vao);
+        sc->glBindBuffer(GL_ARRAY_BUFFER, sc->text_vbo);
+        sc->glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(count * 4 * sizeof(float)), verts, GL_DYNAMIC_DRAW);
+        sc->glDrawArrays(GL_TRIANGLES, 0, count);
+    }
+    free(verts);
+
+    sc->glXSwapBuffers(sc->worker_dpy, sc->child_window);
 }
 
 /* ----------------------------------------------------------------------- */
@@ -3219,6 +3604,8 @@ layer_CreateSwapchainKHR(VkDevice device,
     }
 
     if (!resolve_gl_funcs(sc)) goto fail_gl_setup;
+    setup_hidden_text(sc); /* best-effort -- failure just leaves sc->text_ready
+                               false, checked before every draw_hidden_text call */
 
     /* FLIP_TEST: open the DC device, claim our window, and create the
      * command pool BEFORE the per-image loop, since each image's
