@@ -581,8 +581,13 @@ typedef struct {
     PFN_vkCreateImage            CreateImage;
     PFN_vkDestroyImage           DestroyImage;
     PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements;
+    PFN_vkGetImageSubresourceLayout GetImageSubresourceLayout; /* capture_hidden_snapshot's
+                                        readback -- real rowPitch may have padding. */
     PFN_vkAllocateMemory         AllocateMemory;
     PFN_vkFreeMemory             FreeMemory;
+    PFN_vkMapMemory              MapMemory;   /* capture_hidden_snapshot only --
+                                                  everything else here is DEVICE_LOCAL. */
+    PFN_vkUnmapMemory            UnmapMemory;
     PFN_vkBindImageMemory        BindImageMemory;
     PFN_vkCreateSemaphore        CreateSemaphore;
     PFN_vkDestroySemaphore       DestroySemaphore;
@@ -594,6 +599,7 @@ typedef struct {
 
     PFN_vkGetMemoryFdKHR         GetMemoryFdKHR;
     PFN_vkCmdPipelineBarrier     CmdPipelineBarrier;
+    PFN_vkCmdCopyImage           CmdCopyImage; /* capture_hidden_snapshot only. */
     PFN_vkEndCommandBuffer       EndCommandBuffer;
     /* Per-image command buffer used for the GOB compute dispatch. */
     PFN_vkCreateCommandPool      CreateCommandPool;
@@ -1055,6 +1061,27 @@ typedef struct Swapchain {
     GLuint text_prog, text_vao, text_vbo, text_tex;
     GLint  text_tex_uniform;
 
+    /* Background snapshot of the app's last rendered frame, shown behind
+     * the "presentation paused" text instead of a plain color -- see
+     * capture_hidden_snapshot()'s comment. snap_ready mirrors text_ready's
+     * "resolved OK, but no content captured yet" vs "never even going to
+     * work" distinction: snap_vk_ready gates whether the one-time Vulkan
+     * readback resources exist at all; snap_tex_has_content gates whether
+     * the GL texture actually holds a real captured frame yet (false
+     * until the first hide transition actually captures one -- e.g. the
+     * very first hide of a session, before any frame's been captured). */
+    bool           snap_vk_ready;
+    bool           snap_tex_has_content;
+    VkImage        snap_image;
+    VkDeviceMemory snap_mem;
+    VkCommandBuffer snap_cmdbuf; /* allocated from the existing sc->flip_cpool --
+                                     no separate pool needed, see setup_hidden_snapshot */
+    VkFence        snap_fence;
+    GLuint         bg_prog, bg_vao, bg_vbo, snap_tex;
+    GLint          bg_tex_uniform;
+    GLenum         snap_gl_format; /* GL_BGRA or GL_RGBA, from sc->format --
+                                       see vk_format_to_gl_readback(). */
+
     /* Acquire ring */
     uint32_t      next_acquire;       /* round-robin starting point */
 
@@ -1186,6 +1213,15 @@ static bool other_mapped_surface_exists(Display *dpy, Window self_win);
    transition, before its own definition (with the rest of the "hidden
    overlay placeholder text" section) later in the file. */
 static void draw_hidden_text(Swapchain *sc, int win_w, int win_h);
+/* Forward-declared so worker_thread_main can call it on the visible->hidden
+   transition (before draw_hidden_text, so the frame is captured before the
+   text draws over it), before its own definition later in the file. */
+static void capture_hidden_snapshot(DevNode *dev, Swapchain *sc, PerImage *pi);
+/* Forward-declared so setup_hidden_snapshot (defined next to setup_hidden_text,
+   which comes before this memory-type helper's own definition near the other
+   per-image Vulkan resource creation code) can use it. */
+static int find_memtype(const VkPhysicalDeviceMemoryProperties *p, uint32_t bits,
+                        VkMemoryPropertyFlags want);
 /* Forward-declared so layer_CreateSwapchainKHR can call it for
    ci->oldSwapchain cleanup (recreation handling) before its own definition
    later in the file. */
@@ -1496,8 +1532,13 @@ static void *worker_thread_main(void *arg) {
                  * for the app's own X11 window, which (see
                  * draw_hidden_text's comment) has never had anything
                  * real drawn into it and would otherwise just be black
-                 * underneath. Paint the placeholder message into it now
-                 * that it's about to actually become visible. */
+                 * underneath. Capture the app's current frame as the
+                 * background (best-effort; degrades to a plain color if
+                 * it fails or was never set up), then paint the
+                 * placeholder message over it now that it's about to
+                 * actually become visible. dpi is THIS frame's image --
+                 * the most recent one the app actually rendered. */
+                capture_hidden_snapshot(sc->dev, sc, dpi);
                 draw_hidden_text(sc, last_win_w, last_win_h);
                 sc->flip_hidden = true;
             } else if (!now_hidden && sc->flip_hidden) {
@@ -2026,6 +2067,16 @@ static const char *g_hidden_text_fs =
     "    if (a < 0.5) discard;\n"
     "    FragColor = vec4(1.0, 1.0, 1.0, 1.0);\n"
     "}\n";
+/* Background quad: a plain, opaque texture sample, no discard -- reuses
+   g_hidden_text_vs verbatim for its vertex stage (identical pos/uv
+   passthrough), only the fragment stage differs from the text shader
+   above. */
+static const char *g_hidden_bg_fs =
+    "#version 330 core\n"
+    "in vec2 vUV;\n"
+    "out vec4 FragColor;\n"
+    "uniform sampler2D uTex;\n"
+    "void main() { FragColor = vec4(texture(uTex, vUV).rgb, 1.0); }\n";
 
 /* Compiles one shader stage, logging the info log on failure. Returns 0 on
    failure (matches glCreateShader's own "0 is invalid" convention). */
@@ -2129,6 +2180,244 @@ static bool setup_hidden_text(Swapchain *sc) {
     return true;
 }
 
+/* Vulkan swapchain formats seen in practice on this platform are all
+ * B8G8R8A8 or R8G8B8A8 variants (UNORM/SRGB -- the color space bit
+ * doesn't change the in-memory byte order, which is all a raw GL upload
+ * cares about). Maps sc->format to the matching GL_BGRA/GL_RGBA source
+ * format for glTexImage2D; returns false for anything else so the caller
+ * can skip the snapshot and fall back to the plain background color
+ * (setup_hidden_text's -- draw_hidden_text degrades gracefully either
+ * way) rather than upload garbage. Not attempting to be exhaustive: every
+ * format actually observed in testing (vkgears, Chromium, dolphin-emu,
+ * the Play emulator, DXVK) is one of these four. */
+static bool vk_format_to_gl_readback(VkFormat fmt, GLenum *out_format) {
+    switch (fmt) {
+        case VK_FORMAT_B8G8R8A8_UNORM:
+        case VK_FORMAT_B8G8R8A8_SRGB:
+            *out_format = GL_BGRA;
+            return true;
+        case VK_FORMAT_R8G8B8A8_UNORM:
+        case VK_FORMAT_R8G8B8A8_SRGB:
+            *out_format = GL_RGBA;
+            return true;
+        default:
+            return false;
+    }
+}
+
+/* One-time setup for the "last frame" background behind the placeholder
+ * text (see capture_hidden_snapshot for the per-transition capture this
+ * sets up for): a LINEAR, HOST_VISIBLE staging VkImage sized to
+ * sc->extent that a one-shot vkCmdCopyImage detiles the app's current
+ * OPTIMAL frame into (the same driver-handled OPTIMAL->LINEAR conversion
+ * a copy command always does -- unlike a raw import, this needs no
+ * knowledge of what OPTIMAL's opaque tiling actually is, sidestepping
+ * the exact wall this whole project hit trying to feed OPTIMAL bytes to
+ * anything else directly, see README's "Attempt 1"), a GL texture to
+ * hold the result after CPU upload, and a second GL program (bg_prog)
+ * that just samples it directly -- opaque, no alpha-discard, unlike the
+ * text program above. Called once from layer_CreateSwapchainKHR right
+ * after setup_hidden_text, same context-ownership reasoning as that
+ * function's own comment. Best-effort: on any failure, leaves
+ * snap_vk_ready false (checked before every capture attempt) rather than
+ * failing the swapchain -- worst case, hidden transitions just keep the
+ * plain background color instead of a real frame. */
+static bool setup_hidden_snapshot(DevNode *dev, Swapchain *sc) {
+    if (!sc->glCreateShader) return false;
+    if (!vk_format_to_gl_readback(sc->format, &sc->snap_gl_format)) {
+        LOG_WARN("hidden-snapshot: unhandled swapchain format %d, background "
+                 "will stay a plain color", sc->format);
+        return false;
+    }
+
+    GLuint vs = compile_shader_stage(sc, GL_VERTEX_SHADER, g_hidden_text_vs);
+    GLuint fs = vs ? compile_shader_stage(sc, GL_FRAGMENT_SHADER, g_hidden_bg_fs) : 0;
+    if (!vs || !fs) {
+        if (vs) sc->glDeleteShader(vs);
+        return false;
+    }
+    sc->bg_prog = sc->glCreateProgram();
+    sc->glAttachShader(sc->bg_prog, vs);
+    sc->glAttachShader(sc->bg_prog, fs);
+    sc->glLinkProgram(sc->bg_prog);
+    sc->glDeleteShader(vs);
+    sc->glDeleteShader(fs);
+    GLint linked = 0;
+    sc->glGetProgramiv(sc->bg_prog, GL_LINK_STATUS, &linked);
+    if (!linked) {
+        char log[512];
+        sc->glGetProgramInfoLog(sc->bg_prog, sizeof(log), NULL, log);
+        LOG_WARN("hidden-snapshot program link failed: %s", log);
+        return false;
+    }
+    sc->bg_tex_uniform = sc->glGetUniformLocation(sc->bg_prog, "uTex");
+
+    /* Full-screen quad, NDC corners directly, no per-frame recompute
+       needed (unlike the text VBO, this never changes). */
+    float verts[6][4] = {
+        { -1, -1, 0, 1 }, { 1, -1, 1, 1 }, { -1, 1, 0, 0 },
+        { -1,  1, 0, 0 }, { 1, -1, 1, 1 }, {  1, 1, 1, 0 },
+    };
+    sc->glGenVertexArrays(1, &sc->bg_vao);
+    sc->glGenBuffers(1, &sc->bg_vbo);
+    sc->glBindVertexArray(sc->bg_vao);
+    sc->glBindBuffer(GL_ARRAY_BUFFER, sc->bg_vbo);
+    sc->glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STATIC_DRAW);
+    sc->glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)0);
+    sc->glEnableVertexAttribArray(0);
+    sc->glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)(2 * sizeof(float)));
+    sc->glEnableVertexAttribArray(1);
+    sc->glBindVertexArray(0);
+
+    sc->glGenTextures(1, &sc->snap_tex);
+    sc->glBindTexture(GL_TEXTURE_2D, sc->snap_tex);
+    sc->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    sc->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    sc->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    sc->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    /* The Vulkan side: a LINEAR staging image, HOST_VISIBLE + HOST_COHERENT
+       so it can be mapped and read directly with no explicit flush. */
+    DeviceDispatch *d = &dev->d;
+    VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = sc->format;
+    ici.extent.width = sc->extent.width;
+    ici.extent.height = sc->extent.height;
+    ici.extent.depth = 1;
+    ici.mipLevels = 1; ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_LINEAR;
+    ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (d->CreateImage(dev->device, &ici, NULL, &sc->snap_image) != VK_SUCCESS)
+        return false;
+
+    VkMemoryRequirements mreq;
+    d->GetImageMemoryRequirements(dev->device, sc->snap_image, &mreq);
+    int mt = find_memtype(&dev->memp, mreq.memoryTypeBits,
+                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (mt < 0) { d->DestroyImage(dev->device, sc->snap_image, NULL); sc->snap_image = VK_NULL_HANDLE; return false; }
+    VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    mai.allocationSize = mreq.size;
+    mai.memoryTypeIndex = (uint32_t)mt;
+    if (d->AllocateMemory(dev->device, &mai, NULL, &sc->snap_mem) != VK_SUCCESS ||
+        d->BindImageMemory(dev->device, sc->snap_image, sc->snap_mem, 0) != VK_SUCCESS) {
+        d->DestroyImage(dev->device, sc->snap_image, NULL); sc->snap_image = VK_NULL_HANDLE;
+        return false;
+    }
+
+    VkCommandBufferAllocateInfo cbai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    cbai.commandPool = sc->flip_cpool; /* reused, not a separate pool -- see the
+        snap_cmdbuf field comment. Only ever touched from the worker thread,
+        same as flip_cmdbuf, so no cross-thread pool-usage concern. */
+    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbai.commandBufferCount = 1;
+    if (d->AllocateCommandBuffers(dev->device, &cbai, &sc->snap_cmdbuf) != VK_SUCCESS)
+        return false;
+    VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    if (d->CreateFence(dev->device, &fci, NULL, &sc->snap_fence) != VK_SUCCESS)
+        return false;
+
+    sc->snap_vk_ready = true;
+    LOG_INFO("hidden-overlay background snapshot ready");
+    return true;
+}
+
+/* Captures the app's current frame (pi->image, the SAME image the GOB
+ * compute dispatch below reads from -- SHADER_READ_ONLY_OPTIMAL at this
+ * point, per this layer's own barrier rewriting) into sc->snap_tex, for
+ * draw_hidden_text to show as the background behind the placeholder
+ * message instead of a plain color. Called once per visible->hidden
+ * transition, right before draw_hidden_text -- never per-frame, so the
+ * vkDeviceWaitIdle below (simplest correct way to know the copy and the
+ * readback it gates are both complete before mapping) is a one-shot cost
+ * at a UI transition moment, not a real-time concern; the app's own
+ * rendering stalls for it too, but only for as long as this one copy
+ * takes; using a plain DeviceWaitIdle instead of a dedicated fence/queue
+ * dance is a deliberate simplification given how rarely this runs. */
+static void capture_hidden_snapshot(DevNode *dev, Swapchain *sc, PerImage *pi) {
+    if (!sc->snap_vk_ready) return;
+    DeviceDispatch *d = &dev->d;
+
+    d->ResetFences(dev->device, 1, &sc->snap_fence);
+    VkCommandBufferBeginInfo cbbi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    d->BeginCommandBuffer(sc->snap_cmdbuf, &cbbi);
+
+    VkImageMemoryBarrier barriers[2] = {0};
+    barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barriers[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barriers[0].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[0].image = pi->image;
+    barriers[0].subresourceRange = (VkImageSubresourceRange){ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    barriers[1] = barriers[0];
+    barriers[1].srcAccessMask = 0;
+    barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; /* discard: overwritten
+        wholesale by the copy below every time, never read from first. */
+    barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barriers[1].image = sc->snap_image;
+    d->CmdPipelineBarrier(sc->snap_cmdbuf, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 2, barriers);
+
+    VkImageCopy region = {0};
+    region.srcSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.dstSubresource = region.srcSubresource;
+    region.extent = (VkExtent3D){ sc->extent.width, sc->extent.height, 1 };
+    d->CmdCopyImage(sc->snap_cmdbuf, pi->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    sc->snap_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    /* pi->image back to the layout every other use of it assumes; snap_image
+       to GENERAL, the layout vkMapMemory reads are actually defined for. */
+    barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barriers[0].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barriers[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barriers[1].dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    d->CmdPipelineBarrier(sc->snap_cmdbuf, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+                          0, 0, NULL, 0, NULL, 2, barriers);
+    d->EndCommandBuffer(sc->snap_cmdbuf);
+
+    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &sc->snap_cmdbuf;
+    if (queue_submit_locked(dev, dev->graphics_queue, 1, &si, sc->snap_fence) != VK_SUCCESS)
+        return;
+    d->WaitForFences(dev->device, 1, &sc->snap_fence, VK_TRUE, UINT64_MAX);
+    /* Belt-and-suspenders full stall -- see this function's own comment on
+       why that's an acceptable one-shot cost here. Guarantees the copy is
+       visible to the CPU even if HOST_COHERENT alone left any doubt. */
+    d->DeviceWaitIdle(dev->device);
+
+    VkImageSubresource sub = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0 };
+    VkSubresourceLayout layout;
+    d->GetImageSubresourceLayout(dev->device, sc->snap_image, &sub, &layout);
+    void *mapped = NULL;
+    if (d->MapMemory(dev->device, sc->snap_mem, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS || !mapped)
+        return;
+
+    sc->glBindTexture(GL_TEXTURE_2D, sc->snap_tex);
+    /* rowPitch is in bytes; GL_UNPACK_ROW_LENGTH wants texels. All formats
+       vk_format_to_gl_readback accepts are 4 bytes/texel. */
+    sc->glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)(layout.rowPitch / 4));
+    sc->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)sc->extent.width, (GLsizei)sc->extent.height,
+                     0, sc->snap_gl_format, GL_UNSIGNED_BYTE, (const uint8_t *)mapped + layout.offset);
+    sc->glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    d->UnmapMemory(dev->device, sc->snap_mem);
+
+    sc->snap_tex_has_content = true;
+}
+
 /* Appends one line's worth of quads (6 vertices each, skipping spaces) to
    *out, returning the new vertex count. win_w/win_h are the CURRENT window
    size (re-read every call, not cached from setup time) so the message
@@ -2206,6 +2495,20 @@ static void draw_hidden_text(Swapchain *sc, int win_w, int win_h) {
 
     sc->glClearColor(0.08f, 0.08f, 0.12f, 1.0f);
     sc->glClear(GL_COLOR_BUFFER_BIT);
+
+    /* Background: the app's last captured frame if capture_hidden_snapshot
+       has ever produced one, otherwise the plain clear color above just
+       shows through unobscured -- same graceful-degradation shape as
+       text_ready itself. Drawn before the text below, plain painter's-
+       algorithm order (no depth test anywhere in this pipeline). */
+    if (sc->snap_tex_has_content) {
+        sc->glUseProgram(sc->bg_prog);
+        sc->glActiveTexture(GL_TEXTURE0);
+        sc->glBindTexture(GL_TEXTURE_2D, sc->snap_tex);
+        sc->glUniform1i(sc->bg_tex_uniform, 0);
+        sc->glBindVertexArray(sc->bg_vao);
+        sc->glDrawArrays(GL_TRIANGLES, 0, 6);
+    }
 
     if (count > 0) {
         sc->glUseProgram(sc->text_prog);
@@ -3804,6 +4107,8 @@ layer_CreateSwapchainKHR(VkDevice device,
         LOG_ERR("CreateCommandPool failed");
         goto fail_perimg;
     }
+    setup_hidden_snapshot(dev, sc); /* best-effort, same shape as setup_hidden_text
+        above -- needs sc->flip_cpool, so must come after it's created */
 
     if (!create_gob_pipeline(dev, sc)) {
         LOG_ERR("create_gob_pipeline failed");
@@ -3868,6 +4173,12 @@ fail_perimg:
     if (sc->gob_pipeline)        dev->d.DestroyPipeline(dev->device, sc->gob_pipeline, NULL);
     if (sc->gob_pipeline_layout) dev->d.DestroyPipelineLayout(dev->device, sc->gob_pipeline_layout, NULL);
     if (sc->gob_dsl)             dev->d.DestroyDescriptorSetLayout(dev->device, sc->gob_dsl, NULL);
+    /* snap_cmdbuf is allocated from flip_cpool, freed implicitly below --
+       snap_image/snap_mem/snap_fence are separate objects, not owned by
+       any pool, and need their own explicit teardown. */
+    if (sc->snap_fence) dev->d.DestroyFence(dev->device, sc->snap_fence, NULL);
+    if (sc->snap_image) dev->d.DestroyImage(dev->device, sc->snap_image, NULL);
+    if (sc->snap_mem)   dev->d.FreeMemory(dev->device, sc->snap_mem, NULL);
     if (sc->flip_cpool) dev->d.DestroyCommandPool(dev->device, sc->flip_cpool, NULL);
     if (sc->flip_dc_fd >= 0) close(sc->flip_dc_fd);
 fail_gl_setup:
@@ -3945,6 +4256,11 @@ layer_DestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain,
         if (sc->gob_pipeline)        dev->d.DestroyPipeline(dev->device, sc->gob_pipeline, NULL);
         if (sc->gob_pipeline_layout) dev->d.DestroyPipelineLayout(dev->device, sc->gob_pipeline_layout, NULL);
         if (sc->gob_dsl)             dev->d.DestroyDescriptorSetLayout(dev->device, sc->gob_dsl, NULL);
+        /* snap_image/snap_mem/snap_fence aren't owned by any pool -- see the
+           matching comment in the fail_perimg cleanup path above. */
+        if (sc->snap_fence) dev->d.DestroyFence(dev->device, sc->snap_fence, NULL);
+        if (sc->snap_image) dev->d.DestroyImage(dev->device, sc->snap_image, NULL);
+        if (sc->snap_mem)   dev->d.FreeMemory(dev->device, sc->snap_mem, NULL);
         /* Destroys the per-image flip_cmdbuf allocations implicitly. */
         if (sc->flip_cpool) dev->d.DestroyCommandPool(dev->device, sc->flip_cpool, NULL);
         glXMakeCurrent(sc->surf->dpy, None, NULL);
@@ -4843,8 +5159,11 @@ layer_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInfo *ci,
     D(CreateImage);
     D(DestroyImage);
     D(GetImageMemoryRequirements);
+    D(GetImageSubresourceLayout);
     D(AllocateMemory);
     D(FreeMemory);
+    D(MapMemory);
+    D(UnmapMemory);
     D(BindImageMemory);
     D(CreateSemaphore);
     D(DestroySemaphore);
@@ -4855,6 +5174,7 @@ layer_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInfo *ci,
     D(GetFenceStatus);
     D(GetMemoryFdKHR);
     D(CmdPipelineBarrier);
+    D(CmdCopyImage);
     D(EndCommandBuffer);
     D(CreateCommandPool);
     D(DestroyCommandPool);
