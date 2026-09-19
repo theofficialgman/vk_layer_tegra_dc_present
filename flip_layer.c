@@ -1175,6 +1175,13 @@ static void untrack_swapchain(Swapchain *sc);
    focus-loss check (alt-tab detection) before its own definition, next to
    is_wm_fullscreen, later in the file. */
 static bool is_wm_focused(Display *dpy, Window win);
+/* Forward-declared so worker_thread_main can call it for the per-frame
+   "does some other real window need to be visible right now" check,
+   before its own definition (with the surface registry it reads) next to
+   layer_CreateXlibSurfaceKHR/layer_CreateXcbSurfaceKHR later in the file --
+   see that function's own comment for why is_wm_focused alone isn't
+   enough. */
+static bool other_mapped_surface_exists(Display *dpy, Window self_win);
 /* Forward-declared so worker_thread_main can call it on the visible->hidden
    transition, before its own definition (with the rest of the "hidden
    overlay placeholder text" section) later in the file. */
@@ -1389,29 +1396,44 @@ static void *worker_thread_main(void *arg) {
             }
         }
 
-        /* Detect minimize (unmap) OR losing focus while still mapped (e.g.
+        /* Detect minimize (unmap), losing WM focus while still mapped (e.g.
          * alt-tabbed to another window, no longer the exclusive fullscreen
-         * window -- Xorg is now showing something else on top of it).
-         * FLIP4 presents via a raw hardware overlay plane that ignores X11
-         * window stacking (see README's "when it engages" section), so
-         * without this check the overlay just keeps showing the last
-         * rendered frame on top of whatever the user actually switched to,
-         * in both cases -- confirmed 2026-09-13, reported by user. Checked
-         * on the same worker_dpy round trip as the resize check just
-         * above, so the map_state half adds only one extra request; the
-         * focus half (is_wm_focused) is a further _NET_WM_STATE fetch, the
-         * same one CreateSwapchainKHR's FULLSCREEN GATE already relies on
-         * for FULLSCREEN, just for a different atom in the same property. */
+         * window -- Xorg is now showing something else on top of it), OR a
+         * popup belonging to THIS app appearing (e.g. Chromium's omnibox
+         * dropdown or right-click context menu). FLIP4 presents via a raw
+         * hardware overlay plane that ignores X11 window stacking (see
+         * README's "when it engages" section), so without this check the
+         * overlay just keeps covering whatever the user actually needs to
+         * see, in all three cases -- confirmed 2026-09-13/19, reported by
+         * user. Checked on the same worker_dpy round trip as the resize
+         * check just above, so the map_state check adds only one extra
+         * request.
+         *
+         * is_wm_focused (a _NET_WM_STATE fetch, the same property
+         * CreateSwapchainKHR's FULLSCREEN GATE already relies on for
+         * FULLSCREEN, just a different atom) catches real alt-tabs to an
+         * unrelated application, but is blind to same-app popups: KWin
+         * never touches _NET_WM_STATE_FOCUSED or _NET_ACTIVE_WINDOW for an
+         * override-redirect window at all, confirmed directly (Chromium's
+         * context menu moved neither), so a WM-focus-only check simply
+         * never reacts to that class of popup. other_mapped_surface_exists
+         * catches those instead, by checking this layer's own registry of
+         * every window it has a Vulkan surface for -- see its own comment
+         * for the full reasoning and the known "second independent
+         * top-level window" imprecision it accepts. The two checks are
+         * complementary, not redundant: neither alone covers both cases. */
         {
             XWindowAttributes wattr;
             bool now_unmapped = false;
             if (XGetWindowAttributes(sc->worker_dpy, sc->surf->window, &wattr))
                 now_unmapped = (wattr.map_state != IsViewable);
-            /* Only need the (relatively) more expensive focus check while
-               still mapped -- an unmapped window is unambiguously hidden
-               already, no need to also ask whether it's focused. */
+            /* Only need the (relatively) more expensive focus/popup checks
+               while still mapped -- an unmapped window is unambiguously
+               hidden already. */
             bool now_focused = now_unmapped ? false : is_wm_focused(sc->worker_dpy, sc->surf->window);
-            bool now_hidden = now_unmapped || !now_focused;
+            bool now_other_visible = now_unmapped ? false :
+                other_mapped_surface_exists(sc->worker_dpy, sc->surf->window);
+            bool now_hidden = now_unmapped || !now_focused || now_other_visible;
             if (now_hidden && !sc->flip_hidden) {
                 /* FIRST ATTEMPT (2026-09-13, kept as a record): index = -1
                  * with an otherwise-zeroed windowattr, hoping it meant
@@ -1466,7 +1488,8 @@ static void *worker_thread_main(void *arg) {
                 else
                     LOG_INFO("window %s -- overlay window made transparent",
                              now_unmapped ? "unmapped (minimized)"
-                                          : "lost focus (no longer exclusive fullscreen)");
+                             : !now_focused ? "lost focus (no longer exclusive fullscreen)"
+                                            : "another window of this app needs to be visible (popup/dropdown)");
                 if (dflip.post_syncpt_fd >= 0) close(dflip.post_syncpt_fd);
                 /* The transparent DC flip above only stops the FLIP4
                  * overlay from covering the desktop -- it does nothing
@@ -2955,6 +2978,84 @@ static void destroy_perimage(DevNode *dev, Swapchain *sc, PerImage *pi) {
 /* Surface hooks                                                           */
 /* ----------------------------------------------------------------------- */
 
+/* Registry of every window this process currently has a Vulkan surface
+ * for -- not just whichever one is presenting via FLIP4. A plain global
+ * (like g_swapchains below): each process gets its own copy of this .so's
+ * data segment, so this is automatically scoped to one process -- e.g.
+ * Chromium's single GPU process, which handles the main window AND every
+ * popup's own Vulkan rendering, never anything from an unrelated process.
+ *
+ * Exists to answer "does some other real window need to be visible right
+ * now", for worker_thread_main's per-frame hidden check, alongside (not
+ * instead of) the map_state/is_wm_focused checks next to it. Confirmed
+ * 2026-09-19: Chromium's right-click context menu and its omnibox
+ * dropdown are both genuine separate top-level windows, each with their
+ * own Vulkan surface created through THIS layer (CreateXcbSurfaceKHR logs
+ * a new win= for each one) -- but only the omnibox case ever touches
+ * _NET_WM_STATE_FOCUSED or _NET_ACTIVE_WINDOW on this WM (KWin); the
+ * context menu, an override-redirect window the WM never manages at all,
+ * touches neither, confirmed directly with `xprop -root _NET_ACTIVE_WINDOW`
+ * bracketing the click -- identical before and during. So a check based
+ * purely on WM focus/active-window state provably misses real popups.
+ * This registry doesn't depend on the WM cooperating at all: every
+ * surface this layer creates registers here regardless of what kind of
+ * window it is, and the check below just asks whether any of them
+ * (besides the one asking) is currently mapped.
+ *
+ * Known imprecision, accepted rather than solved here: this can't tell
+ * "a popup belonging to the same app" apart from "a second, independent
+ * top-level window of the same app" (e.g. a second Chromium browser
+ * window) -- both are just "another mapped surface in this process" to
+ * this check. Treating the second case like a popup (hide our overlay
+ * while it's mapped) is a defensible default, not obviously wrong, so
+ * this isn't chasing it further unless it proves to be a real problem. */
+#define MAX_TRACKED_SURFACES 32
+static Surface *g_surfaces[MAX_TRACKED_SURFACES];
+static pthread_mutex_t g_surf_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void register_surface(Surface *s) {
+    pthread_mutex_lock(&g_surf_lock);
+    for (int i = 0; i < MAX_TRACKED_SURFACES; i++)
+        if (!g_surfaces[i]) { g_surfaces[i] = s; break; }
+    pthread_mutex_unlock(&g_surf_lock);
+}
+static void unregister_surface(Surface *s) {
+    pthread_mutex_lock(&g_surf_lock);
+    for (int i = 0; i < MAX_TRACKED_SURFACES; i++)
+        if (g_surfaces[i] == s) { g_surfaces[i] = NULL; break; }
+    pthread_mutex_unlock(&g_surf_lock);
+}
+static bool other_mapped_surface_exists(Display *dpy, Window self_win) {
+    Window candidates[MAX_TRACKED_SURFACES];
+    int n = 0;
+    pthread_mutex_lock(&g_surf_lock);
+    for (int i = 0; i < MAX_TRACKED_SURFACES; i++) {
+        Surface *s = g_surfaces[i];
+        if (s && s->window != self_win) candidates[n++] = s->window;
+    }
+    pthread_mutex_unlock(&g_surf_lock);
+    /* X11 round trips happen outside the lock -- g_surf_lock must never be
+       held across one, or every other thread's register/unregister blocks
+       for however long the server takes to answer. A surface destroyed
+       concurrently between the snapshot above and the query below just
+       means one stale lookup against an already-dead Window XID, which
+       XGetWindowAttributes simply fails for (treated as "not mapped"),
+       not a crash. dpy is the CALLER's own connection (worker_thread_main
+       passes sc->worker_dpy) -- querying any window's attributes works
+       over any connection to the same server regardless of which
+       connection created that window, the same assumption this file
+       already relies on elsewhere (e.g. worker_thread_main using
+       sc->worker_dpy against sc->surf->window, a different connection's
+       window). */
+    for (int i = 0; i < n; i++) {
+        XWindowAttributes wattr;
+        if (XGetWindowAttributes(dpy, candidates[i], &wattr) &&
+            wattr.map_state == IsViewable)
+            return true;
+    }
+    return false;
+}
+
 VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL
 layer_CreateXlibSurfaceKHR(VkInstance instance,
                             const VkXlibSurfaceCreateInfoKHR *pCreateInfo,
@@ -2991,6 +3092,7 @@ layer_CreateXlibSurfaceKHR(VkInstance instance,
             s->icd_inst = instance;
     }
     *pSurface = (VkSurfaceKHR)(uintptr_t)s;
+    register_surface(s);
     LOG_INFO("CreateXlibSurfaceKHR -> surface=%p dpy=%p win=0x%lx", s, s->dpy, s->window);
     clock_gettime(CLOCK_MONOTONIC, &s->debug_create_time);
     s->debug_last_log_time = s->debug_create_time;
@@ -3034,6 +3136,7 @@ layer_CreateXcbSurfaceKHR(VkInstance instance,
             s->icd_inst = instance;
     }
     *pSurface = (VkSurfaceKHR)(uintptr_t)s;
+    register_surface(s);
     LOG_INFO("CreateXcbSurfaceKHR -> surface=%p dpy=%p (opened) win=0x%x",
              s, s->dpy, pCreateInfo->window);
     clock_gettime(CLOCK_MONOTONIC, &s->debug_create_time);
@@ -3054,6 +3157,7 @@ layer_DestroySurfaceKHR(VkInstance instance, VkSurfaceKHR surface,
     }
     if (s->icd_surface && in)
         in->d.DestroySurfaceKHR(s->icd_inst, s->icd_surface, NULL);
+    unregister_surface(s);
     if (s->owns_dpy && s->dpy) XCloseDisplay(s->dpy);
     free(s);
 }
