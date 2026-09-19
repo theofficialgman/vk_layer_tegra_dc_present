@@ -2275,9 +2275,44 @@ static bool setup_hidden_snapshot(DevNode *dev, Swapchain *sc) {
     sc->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     sc->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     sc->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    /* No glTexImage2D here -- deliberately left with no storage until the
+       first real capture (see alloc_snap_image's comment for why its
+       Vulkan-side counterpart is handled the same way). A texture object
+       with parameters set but no image data uploaded costs no GPU memory. */
 
-    /* The Vulkan side: a LINEAR staging image, HOST_VISIBLE + HOST_COHERENT
-       so it can be mapped and read directly with no explicit flush. */
+    DeviceDispatch *d = &dev->d;
+    VkCommandBufferAllocateInfo cbai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    cbai.commandPool = sc->flip_cpool; /* reused, not a separate pool -- see the
+        snap_cmdbuf field comment. Only ever touched from the worker thread,
+        same as flip_cmdbuf, so no cross-thread pool-usage concern. */
+    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbai.commandBufferCount = 1;
+    if (d->AllocateCommandBuffers(dev->device, &cbai, &sc->snap_cmdbuf) != VK_SUCCESS)
+        return false;
+    VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    if (d->CreateFence(dev->device, &fci, NULL, &sc->snap_fence) != VK_SUCCESS)
+        return false;
+
+    sc->snap_vk_ready = true;
+    LOG_INFO("hidden-overlay background snapshot ready");
+    return true;
+}
+
+/* Allocates sc->snap_image/snap_mem -- the LINEAR, HOST_VISIBLE +
+ * HOST_COHERENT staging image capture_hidden_snapshot copies into and
+ * reads back from -- fresh, right before each capture, instead of once
+ * up front in setup_hidden_snapshot. A full-screen 4-byte/pixel image is
+ * real memory (2560x1600 -> 16000KiB, confirmed via
+ * /sys/kernel/debug/nvmap/iovmm/maps on this hardware -- exactly
+ * width*height*4, no tiling padding, matching LINEAR tiling): keeping it
+ * allocated for the swapchain's entire lifetime cost that much VRAM
+ * permanently even for a run that's never actually minimized/backgrounded
+ * once, i.e. most of them. capture_hidden_snapshot frees it again
+ * immediately after uploading to sc->snap_tex, so the only time this
+ * memory exists at all is the few milliseconds an actual hide transition
+ * takes -- a real one-shot cost, same reasoning already applied to that
+ * function's own vkDeviceWaitIdle. */
+static bool alloc_snap_image(DevNode *dev, Swapchain *sc) {
     DeviceDispatch *d = &dev->d;
     VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
     ici.imageType = VK_IMAGE_TYPE_2D;
@@ -2304,24 +2339,10 @@ static bool setup_hidden_snapshot(DevNode *dev, Swapchain *sc) {
     mai.memoryTypeIndex = (uint32_t)mt;
     if (d->AllocateMemory(dev->device, &mai, NULL, &sc->snap_mem) != VK_SUCCESS ||
         d->BindImageMemory(dev->device, sc->snap_image, sc->snap_mem, 0) != VK_SUCCESS) {
+        if (sc->snap_mem) { d->FreeMemory(dev->device, sc->snap_mem, NULL); sc->snap_mem = VK_NULL_HANDLE; }
         d->DestroyImage(dev->device, sc->snap_image, NULL); sc->snap_image = VK_NULL_HANDLE;
         return false;
     }
-
-    VkCommandBufferAllocateInfo cbai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-    cbai.commandPool = sc->flip_cpool; /* reused, not a separate pool -- see the
-        snap_cmdbuf field comment. Only ever touched from the worker thread,
-        same as flip_cmdbuf, so no cross-thread pool-usage concern. */
-    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cbai.commandBufferCount = 1;
-    if (d->AllocateCommandBuffers(dev->device, &cbai, &sc->snap_cmdbuf) != VK_SUCCESS)
-        return false;
-    VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-    if (d->CreateFence(dev->device, &fci, NULL, &sc->snap_fence) != VK_SUCCESS)
-        return false;
-
-    sc->snap_vk_ready = true;
-    LOG_INFO("hidden-overlay background snapshot ready");
     return true;
 }
 
@@ -2336,10 +2357,15 @@ static bool setup_hidden_snapshot(DevNode *dev, Swapchain *sc) {
  * at a UI transition moment, not a real-time concern; the app's own
  * rendering stalls for it too, but only for as long as this one copy
  * takes; using a plain DeviceWaitIdle instead of a dedicated fence/queue
- * dance is a deliberate simplification given how rarely this runs. */
+ * dance is a deliberate simplification given how rarely this runs. Same
+ * reasoning covers alloc_snap_image/DestroyImage/FreeMemory below,
+ * bracketing this whole function -- see its own comment. Every exit path
+ * past a successful alloc_snap_image frees snap_image/snap_mem again
+ * before returning, success or not -- it must never be left allocated. */
 static void capture_hidden_snapshot(DevNode *dev, Swapchain *sc, PerImage *pi) {
     if (!sc->snap_vk_ready) return;
     DeviceDispatch *d = &dev->d;
+    if (!alloc_snap_image(dev, sc)) return;
 
     d->ResetFences(dev->device, 1, &sc->snap_fence);
     VkCommandBufferBeginInfo cbbi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
@@ -2392,7 +2418,7 @@ static void capture_hidden_snapshot(DevNode *dev, Swapchain *sc, PerImage *pi) {
     si.commandBufferCount = 1;
     si.pCommandBuffers = &sc->snap_cmdbuf;
     if (queue_submit_locked(dev, dev->graphics_queue, 1, &si, sc->snap_fence) != VK_SUCCESS)
-        return;
+        goto free_image;
     d->WaitForFences(dev->device, 1, &sc->snap_fence, VK_TRUE, UINT64_MAX);
     /* Belt-and-suspenders full stall -- see this function's own comment on
        why that's an acceptable one-shot cost here. Guarantees the copy is
@@ -2403,19 +2429,26 @@ static void capture_hidden_snapshot(DevNode *dev, Swapchain *sc, PerImage *pi) {
     VkSubresourceLayout layout;
     d->GetImageSubresourceLayout(dev->device, sc->snap_image, &sub, &layout);
     void *mapped = NULL;
-    if (d->MapMemory(dev->device, sc->snap_mem, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS || !mapped)
-        return;
+    if (d->MapMemory(dev->device, sc->snap_mem, 0, VK_WHOLE_SIZE, 0, &mapped) == VK_SUCCESS && mapped) {
+        sc->glBindTexture(GL_TEXTURE_2D, sc->snap_tex);
+        /* rowPitch is in bytes; GL_UNPACK_ROW_LENGTH wants texels. All
+           formats vk_format_to_gl_readback accepts are 4 bytes/texel. */
+        sc->glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)(layout.rowPitch / 4));
+        sc->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)sc->extent.width, (GLsizei)sc->extent.height,
+                         0, sc->snap_gl_format, GL_UNSIGNED_BYTE, (const uint8_t *)mapped + layout.offset);
+        sc->glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+        d->UnmapMemory(dev->device, sc->snap_mem);
+        sc->snap_tex_has_content = true;
+    }
 
-    sc->glBindTexture(GL_TEXTURE_2D, sc->snap_tex);
-    /* rowPitch is in bytes; GL_UNPACK_ROW_LENGTH wants texels. All formats
-       vk_format_to_gl_readback accepts are 4 bytes/texel. */
-    sc->glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)(layout.rowPitch / 4));
-    sc->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)sc->extent.width, (GLsizei)sc->extent.height,
-                     0, sc->snap_gl_format, GL_UNSIGNED_BYTE, (const uint8_t *)mapped + layout.offset);
-    sc->glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-    d->UnmapMemory(dev->device, sc->snap_mem);
-
-    sc->snap_tex_has_content = true;
+free_image:
+    /* Unconditional: snap_image/snap_mem must never outlive this one
+       capture, success or failure -- see alloc_snap_image's comment on
+       why keeping it around longer than that defeats the whole point. */
+    d->DestroyImage(dev->device, sc->snap_image, NULL);
+    d->FreeMemory(dev->device, sc->snap_mem, NULL);
+    sc->snap_image = VK_NULL_HANDLE;
+    sc->snap_mem = VK_NULL_HANDLE;
 }
 
 /* Appends one line's worth of quads (6 vertices each, skipping spaces) to
